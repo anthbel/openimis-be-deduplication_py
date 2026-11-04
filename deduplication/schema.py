@@ -6,6 +6,13 @@ from deduplication.gql_queries import DeduplicationSummaryGQLType, Deduplication
 
 
 class Query(graphene.ObjectType):
+    # Another module's name, and without effect here: `module_name` is only read by
+    # `core.gql.export_mixin.ExportableQueryMixin.get_module_name` (customFilters
+    # routing), which this Query does not inherit from. The rights, for their part, are
+    # anchored per AppConfig (`core.utils.collect_all_gql_permissions` walks the app
+    # configs), so this module's rights stay announced under "deduplication". Left as
+    # it is: a dead attribute, but removing it gains nothing and falls outside this
+    # batch of work.
     module_name = "tasks_management"
 
     beneficiary_deduplication_summary = graphene.Field(
@@ -24,6 +31,10 @@ class Query(graphene.ObjectType):
         from social_protection.apps import SocialProtectionConfig
         from deduplication.services import get_beneficiary_duplication_aggregation
 
+        # A borrowing of another module's right, unjustified from the start and left
+        # as it stands: reading the duplicates summary is guarded by
+        # social_protection's beneficiary search right (170001), not by a deduplication
+        # right. Reported by the audit, to be dealt with in the authorisation batch.
         Query._check_permissions(info.context.user, SocialProtectionConfig.gql_beneficiary_search_perms)
 
         if not columns:
@@ -49,6 +60,9 @@ class Query(graphene.ObjectType):
         from deduplication.services import get_benefit_consumption_duplication_aggregation
 
         # Check permissions
+        # The same borrowing as above, and further removed still: this summary bears
+        # on BenefitConsumption rows (payroll) but is guarded by social_protection's
+        # beneficiary search right (170001). Not fixed here.
         Query._check_permissions(info.context.user, SocialProtectionConfig.gql_beneficiary_search_perms)
 
         if not columns:
