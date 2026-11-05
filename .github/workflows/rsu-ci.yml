@@ -30,7 +30,7 @@ jobs:
     env:
       ASSEMBLY_REF: release/26.10
       MODULE_NAME: deduplication
-      BASE_MODULES: core individual workflow tasks_management location medical medical_pricelist calculation calculation contribution_plan social_protection payment_cycle invoice calcrule_social_protection payroll
+      BASE_MODULES: core individual workflow tasks_management location medical medical_pricelist calculation contribution_plan social_protection payment_cycle invoice calcrule_social_protection payroll
       EXTRA_MODULES: ""
     steps:
       - uses: actions/checkout@v7

@@ -89,9 +89,9 @@ class DuplicateCandidateAccessTest(openIMISGraphQLTestCase):
         self.assertEqual(body["data"]["node"]["kind"], "demographic")
 
     def test_task_reverse_connection_is_refused_to_an_anonymous_user(self):
+        # Task row security hides the task itself, so the connection is never reached.
         body = self._run(self.TASK_CANDIDATES_QUERY, self.task_gid)
-        self.assertTrue(body.get("errors"), body)
-        self.assertNotIn("duplicateCandidates", json.dumps(body.get("data")))
+        self.assertIsNone(body["data"]["node"], body)
 
     def test_task_reverse_connection_is_refused_without_the_query_right(self):
         body = self._run(self.TASK_CANDIDATES_QUERY, self.task_gid, self.limited_token)

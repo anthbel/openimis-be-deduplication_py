@@ -309,8 +309,9 @@ class ResolveLocksSubjectsTest(TestCase):
         locks = self._locks(queries)
         self.assertGreaterEqual(len(locks), 3, locks)
         self.assertEqual([kind for kind, _sql in locks[:3]], ["subject", "subject", "candidate"])
-        self.assertIn(low, locks[0][1])
-        self.assertIn(high, locks[1][1])
+        # The database driver may render a UUID parameter with or without its hyphens.
+        self.assertIn(low.replace("-", ""), locks[0][1].replace("-", ""))
+        self.assertIn(high.replace("-", ""), locks[1][1].replace("-", ""))
         statements = [q["sql"] for q in queries if not q["sql"].startswith(("SAVEPOINT", "RELEASE SAVEPOINT"))]
         self.assertIn("FOR UPDATE", statements[0], "a query ran before the first subject lock")
 
