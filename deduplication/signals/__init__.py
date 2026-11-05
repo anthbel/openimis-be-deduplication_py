@@ -2,7 +2,7 @@ from core.service_signals import ServiceSignalBindType
 from core.signals import bind_service_signal
 from deduplication.services import (
     on_deduplication_task_complete_service_handler,
-    on_payment_benefit_deduplication_task_complete_service_handler
+    on_payment_benefit_deduplication_task_complete_service_handler,
 )
 
 

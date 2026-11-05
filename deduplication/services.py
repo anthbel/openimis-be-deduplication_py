@@ -1,9 +1,11 @@
 import copy
 import logging
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Union, Tuple, Type
+from typing import Dict, List, Optional, Union, Tuple, Type
 from datetime import datetime
 
+from django.apps import apps
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.core.exceptions import FieldDoesNotExist
 from django.db import models
@@ -15,7 +17,12 @@ from django.db import transaction
 from core.datetimes.ad_datetime import AdDate
 from core.models import ExtendableModel, HistoryModel, User, HistoryBusinessModel
 from core.services.utils import model_representation, output_exception
+from core.signals import register_service_signal
 from core.utils import to_json_safe_value
+from deduplication.apps import DeduplicationConfig
+from deduplication.column_resolution import resolve_columns, is_model_column
+from deduplication.models import DuplicateCandidate, ScanState
+from deduplication.sources import Candidate, Watermark, order_pair, sources as registered_sources
 from deduplication.validations import CreateDeduplicationReviewTasksValidation, \
     CreateDeduplicationPaymentReviewTasksValidation
 from individual.models import Individual
@@ -345,23 +352,11 @@ def get_duplication_benefit_aggregation(
 
 def _resolve_columns(model: Union[Type[ExtendableModel], Type[HistoryModel]], columns: List[str]) -> Tuple[
         List[str], List[str]]:
-    fields = []
-    json_fields = []
-    for column in columns:
-        if _is_model_column(model, column.split('__', 1)[0]):
-            fields.append(column)
-        else:
-            json_fields.append(column)
-
-    return fields, json_fields
+    return resolve_columns(model, columns)
 
 
 def _is_model_column(model: Union[Type[ExtendableModel], Type[HistoryModel]], column: str) -> bool:
-    try:
-        model._meta.get_field(column)
-        return True
-    except FieldDoesNotExist:
-        return False
+    return is_model_column(model, column)
 
 
 def _update_instance_if_different_value(instance, instance_kwargs, user):
@@ -493,3 +488,514 @@ def on_payment_benefit_deduplication_task_complete_service_handler(**kwargs):
     except Exception as e:
         logger.error("Error while executing on_task_complete", exc_info=e)
         return [str(e)]
+
+
+# --- Candidate sources: recording, scanning, resolving, merging (seam §4) ---
+
+DUPLICATE_CANDIDATE_TASK_SOURCE = "deduplication_candidate"
+OPEN_TASK_STATUSES = (Task.Status.RECEIVED, Task.Status.ACCEPTED)
+
+# Reviewer-facing text of each refusal code. The mutation journal prints the message as is
+# (no translation), next to the code, so the text is plain English.
+REFUSAL_MESSAGES = {
+    "deduplication.resolve.keep_not_in_pair":
+        "The record to keep is not one of the two records of this pair.",
+    "deduplication.resolve.subject_deleted":
+        "One of the two records is already deleted; they can no longer be merged.",
+    "deduplication.resolve.keep_contradicts_merge":
+        "This pair was already merged under another detection, keeping the other record. "
+        "Keep that record to confirm this detection.",
+    "deduplication.resolve.retired_subject_enrolled":
+        "The record to retire is still a beneficiary or a group member. "
+        "Remove it from its benefit plans and groups first, then merge.",
+    "deduplication.resolve.pair_already_merged":
+        "This pair was already merged under another detection; it can no longer be dismissed.",
+    "deduplication.resolve.decision_missing":
+        "The approver who completed the task recorded no decision for this pair.",
+}
+
+
+class ResolveRefusal(ValueError):
+    """A resolve refused before any write; str() starts with the code, then optional details."""
+
+    def __init__(self, code: str, details: str = ""):
+        self.code = code
+        super().__init__(f"{code}: {details}" if details else code)
+
+    @property
+    def message(self) -> str:
+        return REFUSAL_MESSAGES.get(self.code, self.code)
+
+
+def _merge_evidence(current: dict, incoming: dict) -> dict:
+    """Shallow merge where incoming keys win, except `columns`, which is the union of both."""
+    merged = {**current, **incoming}
+    current_columns = current.get("columns")
+    incoming_columns = incoming.get("columns")
+    if isinstance(current_columns, dict) and isinstance(incoming_columns, dict):
+        merged["columns"] = {**current_columns, **incoming_columns}
+    return merged
+
+
+def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, bool]:
+    """Get-or-create a DuplicateCandidate for c's unique key; never reopens a dismissed row."""
+    subject_a, subject_b = order_pair(c.subject_a, c.subject_b)
+    obj, created = DuplicateCandidate.objects.get_or_create(
+        subject_model=c.subject_model, subject_a=subject_a, subject_b=subject_b, kind=c.kind,
+        defaults={'source': source, 'score': c.score, 'evidence': c.evidence or {}},
+    )
+    if created:
+        return obj, True
+    if obj.status != DuplicateCandidate.Status.OPEN:
+        return obj, False
+
+    changed = False
+    if c.score is not None and (obj.score is None or c.score > obj.score):
+        obj.score = c.score
+        changed = True
+    merged_evidence = _merge_evidence(obj.evidence or {}, c.evidence or {})
+    if merged_evidence != (obj.evidence or {}):
+        obj.evidence = merged_evidence
+        changed = True
+    if changed:
+        obj.save()
+    return obj, False
+
+
+def _scan_source(source) -> int:
+    """Scan one source, record its candidates and advance its watermark; returns the count."""
+    state, _created = ScanState.objects.get_or_create(kind=source.kind)
+    since = None
+    if state.updated_at is not None or state.last_id:
+        since = Watermark(updated_at=state.updated_at, last_id=state.last_id or None)
+
+    # Taken before scanning: a subject written while the scan iterates is newer than this
+    # cursor, so the next scan revisits it; record_candidate makes the revisit harmless.
+    new_watermark = source.watermark()
+    count = 0
+    for candidate in source.scan(since):
+        record_candidate(candidate, source=type(source).__name__)
+        count += 1
+
+    state.updated_at = new_watermark.updated_at
+    state.last_id = new_watermark.last_id or ""
+    state.last_scan_at = datetime.now()
+    state.summary = {'count': count}
+    state.save()
+    return count
+
+
+def run_scan(*, kinds: Optional[List[str]] = None, actor) -> Dict[str, Union[int, Dict[str, str]]]:
+    """
+    Scan registered sources (optionally filtered by kind), record candidates, advance watermarks.
+
+    Returns {kind: count} for the sources that completed. Each source runs in its own
+    transaction: a failing source is logged, its candidates and watermark are rolled back,
+    and the other sources still run. Failures are returned under "failed" as {kind: error};
+    the key is present only when a source failed.
+    """
+    counts = {}
+    failed = {}
+    for source in registered_sources():
+        if kinds and source.kind not in kinds:
+            continue
+        try:
+            with transaction.atomic():
+                counts[source.kind] = _scan_source(source)
+        except Exception as exc:
+            logger.error("Duplicate scan of source %s failed", source.kind, exc_info=exc)
+            failed[source.kind] = str(exc)
+    if failed:
+        counts['failed'] = failed
+    return counts
+
+
+def scan_subject(subject_model: str, subject_id: str) -> List[DuplicateCandidate]:
+    """On-demand full scan across all sources, recording only pairs touching subject_id."""
+    subject_id = str(subject_id)
+    results = []
+    for source in registered_sources():
+        for candidate in source.scan(None):
+            if candidate.subject_model != subject_model:
+                continue
+            if subject_id not in (candidate.subject_a, candidate.subject_b):
+                continue
+            obj, _created = record_candidate(candidate, source=type(source).__name__)
+            results.append(obj)
+    return results
+
+
+class _MergeSignalEmitter:
+    """Wraps the signal-carrying call so `deduplication.subject_merged` fires with a clean payload."""
+
+    @classmethod
+    @register_service_signal('deduplication.subject_merged')
+    def emit(cls, *, subject_model, kept_id, retired_id, actor, policy):
+        return {
+            'subject_model': subject_model,
+            'kept_id': kept_id,
+            'retired_id': retired_id,
+            'actor': actor,
+            'policy': policy,
+        }
+
+
+_SUBJECT_AUDIT_FIELD_NAMES = (
+    {f.name for f in HistoryModel._meta.fields}
+    | {f.name for f in HistoryBusinessModel._meta.fields}
+    | {'json_ext'}
+)
+
+
+def _is_empty(value) -> bool:
+    return value is None or value == ""
+
+
+def _mergeable_fields(model):
+    return [f for f in model._meta.fields if f.name not in _SUBJECT_AUDIT_FIELD_NAMES]
+
+
+def _merge_field_values(kept, retired, actor) -> bool:
+    """Fill empty fields on kept from retired; journal differing non-empty values, never overwrite."""
+    changed = False
+    conflicts = []
+    now = datetime.now()
+
+    for f in _mergeable_fields(type(kept)):
+        kept_value = getattr(kept, f.attname)
+        retired_value = getattr(retired, f.attname)
+        if _is_empty(kept_value) and not _is_empty(retired_value):
+            setattr(kept, f.attname, retired_value)
+            changed = True
+        elif not _is_empty(kept_value) and not _is_empty(retired_value) and kept_value != retired_value:
+            conflicts.append({
+                'field': f.name,
+                'kept': to_json_safe_value(kept_value),
+                'retired': to_json_safe_value(retired_value),
+                'retired_id': str(retired.id),
+                'at': now.isoformat(),
+                'actor': actor.username,
+            })
+
+    kept_ext = dict(kept.json_ext or {})
+    retired_ext = dict(retired.json_ext or {})
+    for key, retired_value in retired_ext.items():
+        if key == 'merge_conflicts':
+            continue
+        kept_value = kept_ext.get(key)
+        if _is_empty(kept_value) and not _is_empty(retired_value):
+            kept_ext[key] = retired_value
+            changed = True
+        elif not _is_empty(kept_value) and not _is_empty(retired_value) and kept_value != retired_value:
+            conflicts.append({
+                'field': key,
+                'kept': to_json_safe_value(kept_value),
+                'retired': to_json_safe_value(retired_value),
+                'retired_id': str(retired.id),
+                'at': now.isoformat(),
+                'actor': actor.username,
+            })
+
+    if conflicts:
+        kept_ext['merge_conflicts'] = kept_ext.get('merge_conflicts', []) + conflicts
+        changed = True
+
+    kept.json_ext = kept_ext
+    return changed
+
+
+def _live_rows(app_label: str, model_name: str):
+    """Non-deleted rows of an optional model, or None when its app is not installed."""
+    try:
+        return apps.get_model(app_label, model_name).objects.filter(is_deleted=False)
+    except LookupError:
+        return None
+
+
+def _enrolment_blockers(retired) -> Dict[str, int]:
+    """
+    Live enrolment rows that keep a retired individual enrolled and payable, by kind:
+    its own Beneficiary rows, its GroupIndividual memberships, and the GroupBeneficiary
+    rows of the groups it belongs to. Other subject models hold none.
+    """
+    if type(retired)._meta.label != 'individual.Individual':
+        return {}
+
+    blockers = {}
+    beneficiaries = _live_rows('social_protection', 'Beneficiary')
+    if beneficiaries is not None:
+        blockers['beneficiary'] = beneficiaries.filter(individual_id=retired.id).count()
+
+    memberships = _live_rows('individual', 'GroupIndividual')
+    group_ids = []
+    if memberships is not None:
+        memberships = memberships.filter(individual_id=retired.id)
+        blockers['group_individual'] = memberships.count()
+        group_ids = list(memberships.values_list('group_id', flat=True))
+
+    group_beneficiaries = _live_rows('social_protection', 'GroupBeneficiary')
+    if group_beneficiaries is not None and group_ids:
+        blockers['group_beneficiary'] = group_beneficiaries.filter(group_id__in=group_ids).count()
+
+    return {kind: count for kind, count in blockers.items() if count}
+
+
+def _require_retired_not_enrolled(retired):
+    """ResolveRefusal("deduplication.resolve.retired_subject_enrolled") while retired holds live enrolment rows."""
+    blockers = _enrolment_blockers(retired)
+    if blockers:
+        rows = ", ".join(f"{kind}={count}" for kind, count in blockers.items())
+        raise ResolveRefusal(
+            "deduplication.resolve.retired_subject_enrolled",
+            f"subject {retired.id} still holds live rows ({rows})",
+        )
+
+
+@transaction.atomic
+def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
+    """
+    Merge retired into kept: fill-empty + conflict journal on both policies, then
+    soft-delete retired ("delete") or mark it retired_into kept before soft-deleting ("retire").
+    Emits deduplication.subject_merged after the transaction commits.
+
+    Raises ResolveRefusal("deduplication.resolve.retired_subject_enrolled: ...") before any write
+    while retired still holds a live Beneficiary, GroupIndividual or GroupBeneficiary row.
+    """
+    policy = policy or DeduplicationConfig.merge_policy
+    if policy not in ('delete', 'retire'):
+        raise ValueError(f"unknown merge policy {policy!r}")
+
+    _require_retired_not_enrolled(retired)
+
+    changed = _merge_field_values(kept, retired, actor)
+    if changed:
+        kept.save(user=actor)
+
+    subject_model_label = type(kept)._meta.label
+    kept_id = str(kept.id)
+    retired_id = str(retired.id)
+
+    if policy == 'retire':
+        retired_ext = dict(retired.json_ext or {})
+        retired_ext['retired_into'] = kept_id
+        retired.json_ext = retired_ext
+        retired.save(user=actor)
+    retired.delete(user=actor)
+
+    transaction.on_commit(lambda: _MergeSignalEmitter.emit(
+        subject_model=subject_model_label, kept_id=kept_id, retired_id=retired_id,
+        actor=actor.username, policy=policy,
+    ))
+    return kept
+
+
+def _pair_candidates(candidate: DuplicateCandidate):
+    """Every candidate on the same unordered pair, whatever its kind, the given one excluded."""
+    return DuplicateCandidate.objects.filter(
+        subject_model=candidate.subject_model, subject_a=candidate.subject_a, subject_b=candidate.subject_b,
+    ).exclude(pk=candidate.pk)
+
+
+def _confirm_open_siblings(candidate: DuplicateCandidate, *, actor, note: str):
+    """Settle the other OPEN kinds of a merged pair with the same decision; dismissed kinds stay."""
+    now = datetime.now()
+    for sibling in _pair_candidates(candidate).select_for_update().filter(status=DuplicateCandidate.Status.OPEN):
+        sibling.status = DuplicateCandidate.Status.CONFIRMED
+        sibling.reviewed_by = actor.username
+        sibling.reviewed_at = now
+        sibling.decision_note = note
+        sibling.save()
+
+
+def _lock_subjects(subject_model: str, subject_ids):
+    """
+    Row-lock the subjects one at a time in sorted id order. Every resolve takes these locks
+    before its candidate row, so two resolves sharing a subject serialise without deadlock.
+    """
+    manager = apps.get_model(subject_model)._base_manager
+    for subject_id in sorted(set(subject_ids)):
+        list(manager.select_for_update().filter(pk=subject_id).values_list('pk', flat=True))
+
+
+@dataclass(frozen=True)
+class ResolvePlan:
+    """What an accepted decision does: merge `retired` into `kept`, or nothing to merge."""
+
+    kept: Optional[models.Model] = None
+    retired: Optional[models.Model] = None
+    merge: bool = False
+
+
+def _validate_decision(decision: str):
+    if decision not in ('same', 'different'):
+        raise ValueError(f"unknown decision {decision!r}")
+
+
+def plan_resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None) -> ResolvePlan:
+    """
+    The preconditions of a decision on an OPEN candidate that read the pair and its siblings,
+    shared by resolve() and check_resolve() so the two cannot drift. Writes nothing.
+    Raises ResolveRefusal with keep_not_in_pair, keep_contradicts_merge, subject_deleted or,
+    for "different", pair_already_merged. A "same" on a pair another kind already merged,
+    keeping the surviving subject, plans no merge.
+    """
+    _validate_decision(decision)
+    if decision == 'different':
+        if _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists():
+            raise ResolveRefusal("deduplication.resolve.pair_already_merged")
+        return ResolvePlan()
+
+    keep_id = str(keep) if keep else candidate.subject_a
+    if keep_id not in (candidate.subject_a, candidate.subject_b):
+        raise ResolveRefusal("deduplication.resolve.keep_not_in_pair")
+    retired_id = candidate.subject_b if keep_id == candidate.subject_a else candidate.subject_a
+    model = apps.get_model(candidate.subject_model)
+    kept = model.objects.get(id=keep_id)
+    retired = model.objects.get(id=retired_id)
+    kept_deleted = getattr(kept, 'is_deleted', False)
+    retired_deleted = getattr(retired, 'is_deleted', False)
+    pair_merged = _pair_candidates(candidate).filter(status=DuplicateCandidate.Status.CONFIRMED).exists()
+    if pair_merged and kept_deleted and not retired_deleted:
+        raise ResolveRefusal("deduplication.resolve.keep_contradicts_merge")
+    if pair_merged and retired_deleted and not kept_deleted:
+        return ResolvePlan(kept=kept, retired=retired)
+    if kept_deleted or retired_deleted:
+        raise ResolveRefusal("deduplication.resolve.subject_deleted")
+    return ResolvePlan(kept=kept, retired=retired, merge=True)
+
+
+def check_resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None) -> None:
+    """
+    Read-only twin of resolve(): raises the ResolveRefusal that resolve() would raise for this
+    decision, and returns None when resolve() would accept it. Takes no lock and writes nothing,
+    so a concurrent resolve can still change the outcome. A candidate that is no longer OPEN
+    needs no decision and is never refused.
+    """
+    _validate_decision(decision)
+    if candidate.status != DuplicateCandidate.Status.OPEN:
+        return
+    plan = plan_resolve(candidate, decision=decision, keep=keep)
+    if plan.merge:
+        _require_retired_not_enrolled(plan.retired)
+
+
+def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None, actor, note: str = ""):
+    """different -> DISMISSED. same -> merge_subjects then CONFIRMED.
+
+    Both subject rows are locked first, in sorted id order, then the candidate row.
+    Only an OPEN candidate is resolved. The row is re-read under a row lock, and a
+    candidate that is already CONFIRMED or DISMISSED is returned unchanged, so a
+    stale decision never merges into a retired subject nor flips a merged pair.
+    A "same" decision raises ValueError, leaving the candidate OPEN, when keep is
+    not one of the pair's two subjects, when either subject is soft-deleted, or when
+    the subject to retire still holds enrolment rows (see merge_subjects).
+
+    A merge confirms the pair once: the other OPEN candidates on the same pair are
+    CONFIRMED in the same transaction. A "same" on a candidate whose pair already has a
+    CONFIRMED sibling is CONFIRMED without a second merge when keep is the surviving
+    subject and the other one is deleted; a keep that contradicts the merge is refused
+    with deduplication.resolve.keep_contradicts_merge. A "different" on a candidate whose
+    pair already has a CONFIRMED sibling is refused with
+    deduplication.resolve.pair_already_merged, leaving the candidate OPEN.
+    """
+    _validate_decision(decision)
+
+    with transaction.atomic():
+        _lock_subjects(candidate.subject_model, (candidate.subject_a, candidate.subject_b))
+        candidate = DuplicateCandidate.objects.select_for_update().get(pk=candidate.pk)
+        if candidate.status != DuplicateCandidate.Status.OPEN:
+            return candidate
+        plan = plan_resolve(candidate, decision=decision, keep=keep)
+        if plan.merge:
+            merge_subjects(plan.kept, plan.retired, actor)
+        candidate.status = (
+            DuplicateCandidate.Status.CONFIRMED if decision == 'same' else DuplicateCandidate.Status.DISMISSED
+        )
+
+        candidate.reviewed_by = actor.username
+        candidate.reviewed_at = datetime.now()
+        candidate.decision_note = note
+        candidate.save()
+        if candidate.status == DuplicateCandidate.Status.CONFIRMED:
+            _confirm_open_siblings(candidate, actor=actor, note=note)
+    return candidate
+
+
+def create_review_tasks(candidate_ids, actor) -> dict:
+    """Create one tasks_management.Task per candidate, source=deduplication_candidate, task FK set.
+
+    Only OPEN candidates without a RECEIVED or ACCEPTED task get a task; the others
+    are skipped, so a pair never has two pending decisions.
+    """
+    try:
+        task_service = TaskService(actor)
+        tasks = []
+        eligible = (
+            DuplicateCandidate.objects
+            .filter(id__in=candidate_ids, status=DuplicateCandidate.Status.OPEN)
+            .exclude(task__status__in=OPEN_TASK_STATUSES)
+        )
+        for candidate in eligible:
+            task_data = {
+                'source': DUPLICATE_CANDIDATE_TASK_SOURCE,
+                'executor_action_event': TasksManagementConfig.default_executor_event,
+                'business_event': '',
+                'data': {
+                    'id': str(candidate.id),
+                    'subject_model': candidate.subject_model,
+                    'subject_a': candidate.subject_a,
+                    'subject_b': candidate.subject_b,
+                    'kind': candidate.kind,
+                    'score': candidate.score,
+                    'evidence': candidate.evidence,
+                },
+            }
+            result = task_service.create(task_data)
+            if result.get('success'):
+                candidate.task_id = result['data']['id']
+                candidate.save()
+            tasks.append(result)
+        return {"success": True, "message": "Ok", "detail": "", "data": tasks}
+    except Exception as exc:
+        return output_exception(model_name='DuplicateCandidate', method="create_review_tasks", exception=exc)
+
+
+def resolve_candidate_of_completing_task(sender, instance, **kwargs):
+    """
+    pre_save receiver of tasks_management.Task. When a deduplication_candidate task moves to
+    COMPLETED, resolves its OPEN candidate with the decision of the approver whose action
+    completes it: json_ext["additional_resolve_data"][<user_updated id>]. It runs inside
+    TaskService.complete_task's transaction, so a refusal rolls the completion back and
+    complete_task returns the refusal in its detail. A candidate that is no longer OPEN
+    needs no decision and the task completes.
+    """
+    if instance.source != DUPLICATE_CANDIDATE_TASK_SOURCE or instance.status != Task.Status.COMPLETED:
+        return
+    if instance.get_dirty_fields().get('status', instance.status) == Task.Status.COMPLETED:
+        return
+
+    candidate_id = (instance.data or {}).get('id')
+    if not candidate_id:
+        return
+    candidate = DuplicateCandidate.objects.filter(id=candidate_id).first()
+    if candidate is None or candidate.status != DuplicateCandidate.Status.OPEN:
+        return
+
+    try:
+        additional_resolve_data = (instance.json_ext or {}).get('additional_resolve_data') or {}
+        resolve_data = additional_resolve_data.get(str(instance.user_updated_id))
+        if not isinstance(resolve_data, dict) or not resolve_data.get('decision'):
+            raise ResolveRefusal("deduplication.resolve.decision_missing")
+        resolve(
+            candidate,
+            decision=resolve_data.get('decision'),
+            keep=resolve_data.get('keep'),
+            actor=instance.user_updated,
+            note=resolve_data.get('note', ''),
+        )
+    except Exception as exc:
+        logger.error(
+            "Task %s not completed: duplicate candidate %s was not resolved (%s)",
+            instance.id, candidate_id, exc,
+        )
+        raise

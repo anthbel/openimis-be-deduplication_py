@@ -33,6 +33,9 @@ from deduplication.apps import (
 EXPECTED_RIGHTS = {
     "gql_create_deduplication_review_perms": ["172001"],
     "gql_create_deduplication_payment_review_perms": ["172002"],
+    "gql_resolve_duplicate_perms": ["172003"],
+    "gql_run_scan_perms": ["172004"],
+    "gql_query_duplicates_perms": ["172005"],
 }
 
 # Historical name in permissions_map.json -> identifier. The django name declared in

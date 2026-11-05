@@ -12,11 +12,11 @@ MODULE_NAME = "deduplication"
 # (payroll.BenefitConsumption); mutations, services and validations are distinct end to
 # end. Each therefore has a single action, `create`.
 #
-# The django names stay purely declarative here: this module has no model at all
-# (models.py is empty), the review being materialised by a tasks_management.Task. The
-# prefix stays `deduplication` because this module is the one that declares and
-# enforces the right, even though no django permission will be created at
-# post_migrate.
+# The candidate workflow is the third entity: `resolve` decides a candidate, `scan` runs
+# the sources, `view` reads candidates.
+#
+# The django names stay purely declarative: nothing grants them, and checks read the
+# numeric rights.
 DJANGO_PERMS = {
     "deduplicationReview": {
         "create": ("deduplication.add_deduplicationreview", 172001),
@@ -28,11 +28,19 @@ DJANGO_PERMS = {
     "paymentDeduplicationReview": {
         "create": ("deduplication.add_paymentdeduplicationreview", 172002),
     },
+    "duplicateCandidate": {
+        "resolve": ("deduplication.change_duplicatecandidate", 172003),
+        "scan": ("deduplication.add_duplicatecandidate", 172004),
+        "view": ("deduplication.view_duplicatecandidate", 172005),
+    },
 }
 
 _PERM_CFG = {
     "gql_create_deduplication_review_perms": ("deduplicationReview", "create"),
     "gql_create_deduplication_payment_review_perms": ("paymentDeduplicationReview", "create"),
+    "gql_resolve_duplicate_perms": ("duplicateCandidate", "resolve"),
+    "gql_run_scan_perms": ("duplicateCandidate", "scan"),
+    "gql_query_duplicates_perms": ("duplicateCandidate", "view"),
 }
 
 RIGHTS = RightsDeclaration(MODULE_NAME, DJANGO_PERMS, _PERM_CFG)
@@ -44,6 +52,11 @@ require = RIGHTS.require
 
 
 DEFAULT_CONFIG = {
+    "subject_model": "individual.Individual",
+    "demographic_columns": ["first_name", "last_name", "dob"],
+    "identifier_keys": [],
+    "identifier_match": "each",
+    "merge_policy": "delete",
 }
 
 
@@ -56,12 +69,23 @@ class DeduplicationConfig(AppConfig):
     # `_perms` key stored in the database.
     gql_create_deduplication_review_perms = RIGHTS.perms("deduplicationReview", "create")
     gql_create_deduplication_payment_review_perms = RIGHTS.perms("paymentDeduplicationReview", "create")
+    gql_resolve_duplicate_perms = RIGHTS.perms("duplicateCandidate", "resolve")
+    gql_run_scan_perms = RIGHTS.perms("duplicateCandidate", "scan")
+    gql_query_duplicates_perms = RIGHTS.perms("duplicateCandidate", "view")
+
+    subject_model = None
+    demographic_columns = None
+    identifier_keys = None
+    identifier_match = None
+    merge_policy = None
 
     def ready(self):
         from core.models import ModuleConfiguration
 
         cfg = ModuleConfiguration.get_or_default(self.name, DEFAULT_CONFIG)
         self.__load_config(cfg)
+        self.__register_builtin_sources()
+        self.__connect_task_bridge()
 
     @classmethod
     def __load_config(cls, cfg):
@@ -71,3 +95,23 @@ class DeduplicationConfig(AppConfig):
         for field in cfg:
             if hasattr(DeduplicationConfig, field):
                 setattr(DeduplicationConfig, field, cfg[field])
+
+    @classmethod
+    def __register_builtin_sources(cls):
+        from deduplication.sources import register
+        from deduplication.sources.demographic import DemographicSource
+        from deduplication.sources.identifier import IdentifierSource
+
+        register(DemographicSource())
+        register(IdentifierSource())
+
+    @classmethod
+    def __connect_task_bridge(cls):
+        from django.db.models.signals import pre_save
+        from deduplication.services import resolve_candidate_of_completing_task
+
+        pre_save.connect(
+            resolve_candidate_of_completing_task,
+            sender='tasks_management.Task',
+            dispatch_uid='deduplication.resolve_candidate_of_completing_task',
+        )
