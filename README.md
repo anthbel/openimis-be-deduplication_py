@@ -22,6 +22,17 @@ direction:
 - `CandidateSource` — ABC with `scan(since)` and `watermark()`.
 - `register(source)` / `sources()` — a process-wide registry, in registration order.
 - `order_pair(a, b)` — sorts two subject ids into the canonical `(a, b)` order.
+- `register_subject_filter(key, subject_filter)` — registers
+  `subject_filter(subject_model, subject_ids)`, which returns the ids among `subject_ids` that
+  scans leave out; `None` removes the key. `run_scan` and `scan_subject` record no candidate
+  with a subject a registered filter leaves out, whatever source found it; the filters are
+  asked once per batch of 500 candidates. A scan's cursor still moves past the subjects left
+  out.
+- `rescan(subject_model, subject_ids)` — moves every source cursor that is past the creation of
+  the earliest of `subject_ids` back before it, so each source's next scan revisits them, for
+  example once a filter no longer leaves them out. A source's cursor must order rows written no
+  earlier than their subject's `date_created`. A scan locks its source's `ScanState` row for its
+  transaction, and `rescan` waits for it.
 
 Two built-in sources are registered automatically (`DeduplicationConfig.ready()`):
 
