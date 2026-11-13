@@ -22,7 +22,8 @@ from core.utils import to_json_safe_value
 from deduplication.apps import DeduplicationConfig
 from deduplication.column_resolution import resolve_columns, is_model_column
 from deduplication.models import DuplicateCandidate, ScanState
-from deduplication.sources import Candidate, Watermark, order_pair, sources as registered_sources
+from deduplication.sources import Candidate, Watermark, order_pair, sources as registered_sources, \
+    without_left_out
 from deduplication.validations import CreateDeduplicationReviewTasksValidation, \
     CreateDeduplicationPaymentReviewTasksValidation
 from individual.models import Individual
@@ -564,7 +565,8 @@ def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, 
 
 def _scan_source(source) -> int:
     """Scan one source, record its candidates and advance its watermark; returns the count."""
-    state, _created = ScanState.objects.get_or_create(kind=source.kind)
+    # Locked until the source's transaction ends, so a rescan waits instead of being overwritten.
+    state, _created = ScanState.objects.select_for_update().get_or_create(kind=source.kind)
     since = None
     if state.updated_at is not None or state.last_id:
         since = Watermark(updated_at=state.updated_at, last_id=state.last_id or None)
@@ -573,7 +575,7 @@ def _scan_source(source) -> int:
     # cursor, so the next scan revisits it; record_candidate makes the revisit harmless.
     new_watermark = source.watermark()
     count = 0
-    for candidate in source.scan(since):
+    for candidate in without_left_out(source.scan(since)):
         record_candidate(candidate, source=type(source).__name__)
         count += 1
 
@@ -615,11 +617,11 @@ def scan_subject(subject_model: str, subject_id: str) -> List[DuplicateCandidate
     subject_id = str(subject_id)
     results = []
     for source in registered_sources():
-        for candidate in source.scan(None):
-            if candidate.subject_model != subject_model:
-                continue
-            if subject_id not in (candidate.subject_a, candidate.subject_b):
-                continue
+        touching = (
+            candidate for candidate in source.scan(None)
+            if candidate.subject_model == subject_model and subject_id in (candidate.subject_a, candidate.subject_b)
+        )
+        for candidate in without_left_out(touching):
             obj, _created = record_candidate(candidate, source=type(source).__name__)
             results.append(obj)
     return results
