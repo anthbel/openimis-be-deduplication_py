@@ -111,8 +111,9 @@ def rescan(subject_model: str, subject_ids: Iterable[str]) -> None:
     """Moves back, before the creation of the earliest of ``subject_ids``, every source cursor that is past it,
     so the next scan of each source revisits those subjects; a source never scanned keeps no cursor.
 
-    A source's cursor must order rows written no earlier than their subject's ``date_created``. The cursor
-    rows are locked, so a scan running meanwhile finishes first and cannot write its cursor over this one.
+    A source's cursor must order rows written no earlier than their subject's ``date_created``. Every cursor
+    row is locked before any is compared, so a scan running meanwhile finishes first and its new cursor is
+    the one compared and moved back.
     """
     from django.apps import apps
     from django.db import transaction
@@ -129,7 +130,10 @@ def rescan(subject_model: str, subject_ids: Iterable[str]) -> None:
         return
     before = created - timedelta(microseconds=1)
     with transaction.atomic():
-        for state in ScanState.objects.select_for_update().filter(updated_at__gt=before).order_by("kind"):
+        # A WHERE on updated_at would be checked against the cursor committed before a running scan's.
+        for state in ScanState.objects.select_for_update().order_by("kind"):
+            if state.updated_at is None or state.updated_at <= before:
+                continue
             state.updated_at = before
             state.last_id = ""
             state.save(update_fields=["updated_at", "last_id"])

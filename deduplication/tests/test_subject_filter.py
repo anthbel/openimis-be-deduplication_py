@@ -1,11 +1,14 @@
+import datetime
+import threading
+import time
 from unittest import mock
 
-from django.db import connection
-from django.test import TestCase
+from django.db import connection, connections
+from django.test import TestCase, TransactionTestCase
 
 from deduplication.models import DuplicateCandidate, ScanState
 from deduplication.services import run_scan, scan_subject
-from deduplication.sources import Candidate, CandidateSource, register_subject_filter, rescan
+from deduplication.sources import Candidate, CandidateSource, Watermark, register_subject_filter, rescan
 from deduplication.sources.subject import subject_watermark
 from deduplication.tests.helpers import LogInHelper, override_deduplication_config
 from individual.models import Individual
@@ -124,3 +127,92 @@ class RescanTest(TestCase):
         before = ScanState.objects.get(kind="demographic").updated_at
         rescan(PERSON, [])
         self.assertEqual(ScanState.objects.get(kind="demographic").updated_at, before)
+
+
+WAIT_SECONDS = 10
+WAITING_ON_A_LOCK = (
+    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+    "AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()"
+)
+RACE_KIND = "rescan-race"
+RACE_NAME = "RescanRace"
+
+
+class _SlowSource(CandidateSource):
+    """Its scan waits, inside the scan's transaction, until another connection waits on a lock."""
+    kind = RACE_KIND
+
+    def __init__(self, cursor_at, in_scan, waited):
+        self.cursor_at, self.in_scan, self.waited = cursor_at, in_scan, waited
+
+    def watermark(self):
+        return Watermark(updated_at=self.cursor_at, last_id="")
+
+    def scan(self, since):
+        self.in_scan.set()
+        self.waited.append(_wait_for_a_lock_waiter())
+        return iter(())
+
+
+def _wait_for_a_lock_waiter():
+    """Waits until another backend of this database waits on a lock; False after WAIT_SECONDS."""
+    deadline = time.monotonic() + WAIT_SECONDS
+    with connection.cursor() as cursor:
+        while time.monotonic() < deadline:
+            # The statistics views keep one snapshot per transaction unless it is cleared.
+            cursor.execute("SELECT pg_stat_clear_snapshot()")
+            cursor.execute(WAITING_ON_A_LOCK)
+            if cursor.fetchone()[0]:
+                return True
+            time.sleep(0.05)
+    return False
+
+
+class RescanDuringScanTest(TransactionTestCase):
+    """Two connections: a rescan while a scan of the same source runs moves back the cursor that scan writes."""
+
+    def setUp(self):
+        if connection.vendor != "postgresql":
+            self.skipTest("This test can only be executed for PSQL database")
+        self.user = LogInHelper().get_or_create_user_api()
+        self.person = Individual(first_name="Race", last_name=RACE_NAME, dob="1992-02-02")
+        self.person.save(username=self.user.username)
+        ScanState.objects.create(kind=RACE_KIND, updated_at=self.person.date_created - datetime.timedelta(days=1))
+
+    def _fixture_teardown(self):
+        ScanState.objects.filter(kind=RACE_KIND).delete()
+        with connection.cursor() as cursor:
+            for model in (Individual, Individual.history.model):
+                table = connection.ops.quote_name(model._meta.db_table)
+                cursor.execute(f"DELETE FROM {table} WHERE last_name = %s", [RACE_NAME])
+
+    @staticmethod
+    def in_thread(name, target, results, start=None):
+        def body():
+            try:
+                if start is not None:
+                    start.wait(WAIT_SECONDS)
+                results[name] = target()
+            except Exception as exc:
+                results[name] = exc
+            finally:
+                connections.close_all()
+
+        return threading.Thread(target=body, name=name)
+
+    def test_a_rescan_waits_for_the_running_scan_and_moves_its_new_cursor_back(self):
+        in_scan, waited, results = threading.Event(), [], {}
+        source = _SlowSource(self.person.date_created + datetime.timedelta(seconds=1), in_scan, waited)
+        scan = self.in_thread("scan", lambda: run_scan(kinds=[RACE_KIND], actor=self.user), results)
+        again = self.in_thread("rescan", lambda: rescan(PERSON, [str(self.person.id)]), results, start=in_scan)
+        with mock.patch("deduplication.services.registered_sources", return_value=[source]):
+            for thread in (scan, again):
+                thread.start()
+            for thread in (scan, again):
+                thread.join(4 * WAIT_SECONDS)
+                self.assertFalse(thread.is_alive(), thread.name)
+
+        self.assertEqual(results["scan"], {RACE_KIND: 0}, results)
+        self.assertIsNone(results["rescan"], results)
+        self.assertEqual(waited, [True])
+        self.assertLess(ScanState.objects.get(kind=RACE_KIND).updated_at, self.person.date_created)
