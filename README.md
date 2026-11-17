@@ -122,6 +122,10 @@ Services (`deduplication/services.py`):
 - `MERGE_POLICY` (module config `merge_policy`, default `"delete"`) then decides how
   `retired` is retired: `"delete"` soft-deletes it; `"retire"` first sets
   `retired.json_ext["retired_into"] = kept.id`, then soft-deletes it.
+- A merge preparer registered with `deduplication.sources.register_merge_preparer` runs inside `resolve`:
+  its lock phase before the subject locks, its prepare phase before the enrolment guard. It may refuse the
+  merge (`MergeRefusal`, reported with its code) or answer `fill=False`, which leaves `kept` unchanged, with
+  no journal (`docs/wb-biometric-dedup-seam.md`, §4.3).
 - After the transaction commits, the `deduplication.subject_merged` service signal fires
   with `subject_model`, `kept_id`, `retired_id`, `actor`, `policy` (read off
   `kwargs["result"]` by an `AFTER` receiver, the same pattern as this module's other

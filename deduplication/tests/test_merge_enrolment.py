@@ -3,14 +3,14 @@ from django.test import TestCase
 from deduplication.models import DuplicateCandidate
 from deduplication.services import merge_subjects, resolve
 from deduplication.sources import order_pair
-from deduplication.tests.helpers import LogInHelper
+from deduplication.tests.helpers import LogInHelper, WithoutMergePreparers
 from individual.models import Group, GroupIndividual, Individual
 from social_protection.models import Beneficiary, BeneficiaryStatus, BenefitPlan, GroupBeneficiary
 
 ENROLLED = "deduplication.resolve.retired_subject_enrolled"
 
 
-class RetiredSubjectEnrolmentTest(TestCase):
+class RetiredSubjectEnrolmentTest(WithoutMergePreparers, TestCase):
     """A subject that still holds enrolment rows is not retired: payroll would keep paying it."""
 
     @classmethod

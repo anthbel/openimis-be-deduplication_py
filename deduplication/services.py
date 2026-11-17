@@ -23,8 +23,8 @@ from deduplication.apps import DeduplicationConfig
 from deduplication.column_resolution import resolve_columns, is_model_column
 from deduplication.masking import mask_review_task_data
 from deduplication.models import DuplicateCandidate, ScanState
-from deduplication.sources import Candidate, Watermark, order_pair, sources as registered_sources, \
-    without_left_out
+from deduplication.sources import Candidate, MergePlan, MergeRefusal, Watermark, merge_preparers, order_pair, \
+    sources as registered_sources, without_left_out
 from deduplication.validations import CreateDeduplicationReviewTasksValidation, \
     CreateDeduplicationPaymentReviewTasksValidation
 from individual.data_masking import may_see_masked
@@ -530,13 +530,14 @@ REFUSAL_MESSAGES = {
 class ResolveRefusal(ValueError):
     """A resolve refused before any write; str() starts with the code, then optional details."""
 
-    def __init__(self, code: str, details: str = ""):
+    def __init__(self, code: str, details: str = "", message: Optional[str] = None):
         self.code = code
+        self._message = message
         super().__init__(f"{code}: {details}" if details else code)
 
     @property
     def message(self) -> str:
-        return REFUSAL_MESSAGES.get(self.code, self.code)
+        return self._message or REFUSAL_MESSAGES.get(self.code, self.code)
 
 
 def _merge_evidence(current: dict, incoming: dict) -> dict:
@@ -618,9 +619,29 @@ def run_scan(*, kinds: Optional[List[str]] = None, actor) -> Dict[str, Union[int
         except Exception as exc:
             logger.error("Duplicate scan of source %s failed", source.kind, exc_info=exc)
             failed[source.kind] = str(exc)
+            _record_scan_failure(source.kind, exc)
     if failed:
         counts['failed'] = failed
     return counts
+
+
+def _save_scan_failure(kind: str, exc: Exception):
+    state, _created = ScanState.objects.select_for_update().get_or_create(kind=kind)
+    state.summary = {**(state.summary or {}), 'last_failure': {
+        'at': datetime.now().isoformat(), 'error_class': type(exc).__name__,
+    }}
+    state.save(update_fields=['summary'])
+
+
+def _record_scan_failure(kind: str, exc: Exception):
+    """Records the class of a failed scan's error on the source's ScanState summary, in its own transaction, the
+    cursor and last_scan_at left as they were. The error's text, which can quote a subject's value, is not
+    stored. A failure to record is logged and does not stop the scan of the other sources."""
+    try:
+        with transaction.atomic():
+            _save_scan_failure(kind, exc)
+    except Exception as record_exc:
+        logger.error("Failure of duplicate scan source %s not recorded", kind, exc_info=record_exc)
 
 
 def scan_subject(subject_model: str, subject_id: str) -> List[DuplicateCandidate]:
@@ -668,53 +689,61 @@ def _mergeable_fields(model):
     return [f for f in model._meta.fields if f.name not in _SUBJECT_AUDIT_FIELD_NAMES]
 
 
-def _merge_field_values(kept, retired, actor) -> bool:
-    """Fill empty fields on kept from retired; journal differing non-empty values, never overwrite."""
-    changed = False
-    conflicts = []
-    now = datetime.now()
-
+def _merge_differences(kept, retired):
+    """(fills, conflicts) of a merge of retired into kept: fills are (name, retired value, is a model field) for
+    the fields kept leaves empty and retired holds; conflicts are (name, kept value, retired value) for the fields
+    both hold with different values. Model fields come first, then the json_ext keys."""
+    fills, conflicts = [], []
     for f in _mergeable_fields(type(kept)):
         kept_value = getattr(kept, f.attname)
         retired_value = getattr(retired, f.attname)
         if _is_empty(kept_value) and not _is_empty(retired_value):
-            setattr(kept, f.attname, retired_value)
-            changed = True
+            fills.append((f.attname, retired_value, True))
         elif not _is_empty(kept_value) and not _is_empty(retired_value) and kept_value != retired_value:
-            conflicts.append({
-                'field': f.name,
-                'kept': to_json_safe_value(kept_value),
-                'retired': to_json_safe_value(retired_value),
-                'retired_id': str(retired.id),
-                'at': now.isoformat(),
-                'actor': actor.username,
-            })
+            conflicts.append((f.name, kept_value, retired_value))
 
-    kept_ext = dict(kept.json_ext or {})
-    retired_ext = dict(retired.json_ext or {})
-    for key, retired_value in retired_ext.items():
+    kept_ext = kept.json_ext or {}
+    for key, retired_value in (retired.json_ext or {}).items():
         if key == 'merge_conflicts':
             continue
         kept_value = kept_ext.get(key)
         if _is_empty(kept_value) and not _is_empty(retired_value):
-            kept_ext[key] = retired_value
-            changed = True
+            fills.append((key, retired_value, False))
         elif not _is_empty(kept_value) and not _is_empty(retired_value) and kept_value != retired_value:
-            conflicts.append({
-                'field': key,
-                'kept': to_json_safe_value(kept_value),
-                'retired': to_json_safe_value(retired_value),
-                'retired_id': str(retired.id),
-                'at': now.isoformat(),
-                'actor': actor.username,
-            })
+            conflicts.append((key, kept_value, retired_value))
+    return fills, conflicts
 
+
+def merge_field_names(kept, retired) -> List[str]:
+    """The names of the fields a merge of retired into kept would fill or journal as a conflict."""
+    fills, conflicts = _merge_differences(kept, retired)
+    names = [kept._meta.get_field(name).name if is_column else name for name, _value, is_column in fills]
+    return names + [name for name, _kept, _retired in conflicts]
+
+
+def _merge_field_values(kept, retired, actor) -> bool:
+    """Fill empty fields on kept from retired; journal differing non-empty values, never overwrite."""
+    fills, differing = _merge_differences(kept, retired)
+    now = datetime.now()
+    kept_ext = dict(kept.json_ext or {})
+    for name, retired_value, is_column in fills:
+        if is_column:
+            setattr(kept, name, retired_value)
+        else:
+            kept_ext[name] = retired_value
+    conflicts = [{
+        'field': name,
+        'kept': to_json_safe_value(kept_value),
+        'retired': to_json_safe_value(retired_value),
+        'retired_id': str(retired.id),
+        'at': now.isoformat(),
+        'actor': actor.username,
+    } for name, kept_value, retired_value in differing]
     if conflicts:
         kept_ext['merge_conflicts'] = kept_ext.get('merge_conflicts', []) + conflicts
-        changed = True
 
     kept.json_ext = kept_ext
-    return changed
+    return bool(fills or conflicts)
 
 
 def _live_rows(app_label: str, model_name: str):
@@ -725,11 +754,12 @@ def _live_rows(app_label: str, model_name: str):
         return None
 
 
-def _enrolment_blockers(retired) -> Dict[str, int]:
+def _enrolment_blockers(retired, released_group_ids=()) -> Dict[str, int]:
     """
     Live enrolment rows that keep a retired individual enrolled and payable, by kind:
     its own Beneficiary rows, its GroupIndividual memberships, and the GroupBeneficiary
-    rows of the groups it belongs to. Other subject models hold none.
+    rows of the groups it belongs to. Other subject models hold none. The memberships of
+    ``released_group_ids``, which a merge preparer ends, are not counted.
     """
     if type(retired)._meta.label != 'individual.Individual':
         return {}
@@ -742,7 +772,7 @@ def _enrolment_blockers(retired) -> Dict[str, int]:
     memberships = _live_rows('individual', 'GroupIndividual')
     group_ids = []
     if memberships is not None:
-        memberships = memberships.filter(individual_id=retired.id)
+        memberships = memberships.filter(individual_id=retired.id).exclude(group_id__in=list(released_group_ids))
         blockers['group_individual'] = memberships.count()
         group_ids = list(memberships.values_list('group_id', flat=True))
 
@@ -753,9 +783,9 @@ def _enrolment_blockers(retired) -> Dict[str, int]:
     return {kind: count for kind, count in blockers.items() if count}
 
 
-def _require_retired_not_enrolled(retired):
+def _require_retired_not_enrolled(retired, released_group_ids=()):
     """ResolveRefusal("deduplication.resolve.retired_subject_enrolled") while retired holds live enrolment rows."""
-    blockers = _enrolment_blockers(retired)
+    blockers = _enrolment_blockers(retired, released_group_ids)
     if blockers:
         rows = ", ".join(f"{kind}={count}" for kind, count in blockers.items())
         raise ResolveRefusal(
@@ -765,10 +795,11 @@ def _require_retired_not_enrolled(retired):
 
 
 @transaction.atomic
-def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
+def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None, fill: bool = True):
     """
     Merge retired into kept: fill-empty + conflict journal on both policies, then
     soft-delete retired ("delete") or mark it retired_into kept before soft-deleting ("retire").
+    With ``fill`` False, kept is left as it is: no fill and no journal.
     Emits deduplication.subject_merged after the transaction commits.
 
     Raises ResolveRefusal("deduplication.resolve.retired_subject_enrolled: ...") before any write
@@ -780,8 +811,7 @@ def merge_subjects(kept, retired, actor, *, policy: Optional[str] = None):
 
     _require_retired_not_enrolled(retired)
 
-    changed = _merge_field_values(kept, retired, actor)
-    if changed:
+    if fill and _merge_field_values(kept, retired, actor):
         kept.save(user=actor)
 
     subject_model_label = type(kept)._meta.label
@@ -818,6 +848,38 @@ def _confirm_open_siblings(candidate: DuplicateCandidate, *, actor, note: str):
         sibling.reviewed_at = now
         sibling.decision_note = note
         sibling.save()
+
+
+def _refused_by_preparer(refusal: MergeRefusal) -> ResolveRefusal:
+    return ResolveRefusal(refusal.code, refusal.details, message=refusal.message)
+
+
+def _lock_for_preparers(candidate: DuplicateCandidate, keep: Optional[str]) -> list:
+    """The lock phase of each merge preparer, in order; returns their tokens for prepare."""
+    try:
+        return [(preparer, preparer.lock(candidate, keep)) for preparer in merge_preparers()]
+    except MergeRefusal as refusal:
+        raise _refused_by_preparer(refusal)
+
+
+def _prepare_merge(candidate: DuplicateCandidate, plan: "ResolvePlan", *, actor, check: bool,
+                   locked: Optional[list] = None) -> MergePlan:
+    """Runs the prepare phase of every merge preparer; fill is False when any preparer says so, and the released
+    groups are those of every preparer."""
+    tokens = {id(preparer): token for preparer, token in (locked or [])}
+    fill, released = True, set()
+    merge_fields = merge_field_names(plan.kept, plan.retired)
+    try:
+        for preparer in merge_preparers():
+            answer = preparer.prepare(
+                candidate, plan.kept, plan.retired, actor=actor, check=check,
+                locked=tokens.get(id(preparer)), merge_fields=list(merge_fields),
+            ) or MergePlan()
+            fill = fill and answer.fill
+            released.update(answer.released_group_ids)
+    except MergeRefusal as refusal:
+        raise _refused_by_preparer(refusal)
+    return MergePlan(fill=fill, released_group_ids=frozenset(released))
 
 
 def _lock_subjects(subject_model: str, subject_ids):
@@ -889,13 +951,17 @@ def check_resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optiona
         return
     plan = plan_resolve(candidate, decision=decision, keep=keep)
     if plan.merge:
-        _require_retired_not_enrolled(plan.retired)
+        merge_plan = _prepare_merge(candidate, plan, actor=None, check=True)
+        _require_retired_not_enrolled(plan.retired, merge_plan.released_group_ids)
 
 
 def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str] = None, actor, note: str = ""):
     """different -> DISMISSED. same -> merge_subjects then CONFIRMED.
 
-    Both subject rows are locked first, in sorted id order, then the candidate row.
+    For a "same" decision the lock phase of each merge preparer runs first. Both subject
+    rows are then locked, in sorted id order, then the candidate row. A merge runs the
+    preparers' prepare phase before the enrolment guard, and skips the fill when one of
+    them answers fill=False; a MergeRefusal of either phase is raised as a ResolveRefusal.
     Only an OPEN candidate is resolved. The row is re-read under a row lock, and a
     candidate that is already CONFIRMED or DISMISSED is returned unchanged, so a
     stale decision never merges into a retired subject nor flips a merged pair.
@@ -914,13 +980,15 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
     _validate_decision(decision)
 
     with transaction.atomic():
+        locked = _lock_for_preparers(candidate, keep) if decision == 'same' else []
         _lock_subjects(candidate.subject_model, (candidate.subject_a, candidate.subject_b))
         candidate = DuplicateCandidate.objects.select_for_update().get(pk=candidate.pk)
         if candidate.status != DuplicateCandidate.Status.OPEN:
             return candidate
         plan = plan_resolve(candidate, decision=decision, keep=keep)
         if plan.merge:
-            merge_subjects(plan.kept, plan.retired, actor)
+            merge_plan = _prepare_merge(candidate, plan, actor=actor, check=False, locked=locked)
+            merge_subjects(plan.kept, plan.retired, actor, fill=merge_plan.fill)
         candidate.status = (
             DuplicateCandidate.Status.CONFIRMED if decision == 'same' else DuplicateCandidate.Status.DISMISSED
         )
