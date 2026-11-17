@@ -86,6 +86,7 @@ class DeduplicationConfig(AppConfig):
         self.__load_config(cfg)
         self.__register_builtin_sources()
         self.__connect_task_bridge()
+        self.__register_review_task_masker()
 
     @classmethod
     def __load_config(cls, cfg):
@@ -104,6 +105,14 @@ class DeduplicationConfig(AppConfig):
 
         register(DemographicSource())
         register(IdentifierSource())
+
+    @classmethod
+    def __register_review_task_masker(cls):
+        from individual.task_masking import TaskMask
+        from deduplication.masking import mask_review_task
+        from deduplication.services import DUPLICATE_CANDIDATE_TASK_SOURCE
+
+        TaskMask.register_source(DUPLICATE_CANDIDATE_TASK_SOURCE, mask_review_task)
 
     @classmethod
     def __connect_task_bridge(cls):

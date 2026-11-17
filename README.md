@@ -69,6 +69,12 @@ the mask of the subject model masks (`individual`'s person or group mask, with t
 other modules register) is masked by that mask; every value is masked when `subject_model`
 names no model. Other evidence keys are given as stored.
 
+A review task (source `deduplication_candidate`) holds a copy of its candidate's evidence in its
+`data`. The module registers a masker for that source with `individual`'s task mask
+(`TaskMask.register_source`), so the task's `data` and `businessData` give the evidence masked
+the same way to a user without the masked-data right, on the task queries and through
+`duplicateCandidates { task }`.
+
 Services (`deduplication/services.py`):
 
 - `record_candidate(candidate, source=...)` — get-or-creates the row; an `OPEN` row keeps

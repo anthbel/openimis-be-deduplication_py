@@ -38,6 +38,15 @@ def masked_evidence(subject_model, evidence):
     return masked
 
 
+def mask_review_task(task):
+    """Masks in place the candidate evidence a review task copies into its data, as ``masked_evidence`` masks
+    it. Registered with individual's task mask, which applies it for a reader without the masked-data right."""
+    data = getattr(task, "data", None)
+    if isinstance(data, dict) and "evidence" in data:
+        data["evidence"] = masked_evidence(data.get("subject_model"), data["evidence"])
+    return task
+
+
 def mask_summary_values(model, column_values, person):
     """Replaces in place the values of ``column_values`` ({column: value as text}, one summary row read on
     ``model``) whose column reads a masked field by the string mask."""
