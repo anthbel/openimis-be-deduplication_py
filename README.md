@@ -13,7 +13,13 @@ For a user without the masked-data right (core `gql_query_enable_viewing_masked_
 900101), a summary column that reads a field a registered mask masks gives the string mask
 in `columnValues`: a column of the beneficiary or benefit, of its person (`individual`'s
 person mask, with the fields other modules register), or a `json_ext` key masked on either.
+A column reading the beneficiary's or benefit's own `json_ext` (a bare key, `json_ext__<key>`
+or `json_ext`) is also checked against the person's `json_ext`, which it may copy.
 Grouping and counts are computed on the stored values.
+
+The `businessData` of the beneficiary and payment review tasks is masked the same way for a
+reader without 900101: each beneficiary or benefit row, its person, and the summary row
+(`column_values`) the task was made from.
 
 ## Candidate sources
 
