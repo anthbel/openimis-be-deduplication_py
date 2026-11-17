@@ -1,7 +1,10 @@
+from datetime import datetime, timedelta
+
 from django.core.exceptions import ImproperlyConfigured
 from django.db import connection
 from django.test import TestCase
 
+from deduplication.models import ScanState
 from deduplication.sources import order_pair, sources
 from deduplication.sources.demographic import DemographicSource
 from deduplication.sources.identifier import IdentifierSource
@@ -201,3 +204,65 @@ class DemographicSourceNullGroupingTest(TestCase):
             "subjects without a village_code were grouped together",
         )
         self.assertIn(order_pair(str(self.inds[3].id), str(self.inds[4].id)), pairs)
+
+
+class SubjectSourceCoverageTest(TestCase):
+    """covered() of the subject sources: a subject is covered when its (date_updated, id) is at or before the
+    source's cursor; an empty cursor covers nobody."""
+
+    LABEL = "individual.Individual"
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.persons = []
+        for data in individuals_data[:3]:
+            person = Individual(**data)
+            person.save(username=cls.user.username)
+            cls.persons.append(person)
+        cls.persons.sort(key=lambda person: (person.date_updated, str(person.id)))
+
+    def state_at(self, person):
+        return ScanState(kind="demographic", updated_at=person.date_updated, last_id=str(person.id),
+                         last_scan_at=datetime.now())
+
+    def test_subjects_at_or_before_the_cursor_are_covered(self):
+        first, middle, last = self.persons
+        ids = [person.id for person in self.persons]
+        for source in (DemographicSource(), IdentifierSource()):
+            with self.subTest(kind=source.kind):
+                self.assertEqual(source.covered(self.LABEL, ids, self.state_at(middle)), {first.id, middle.id})
+                self.assertEqual(source.covered(self.LABEL, ids, self.state_at(last)), set(ids))
+
+    def test_a_subject_changed_after_the_cursor_is_not_covered(self):
+        first, middle, last = self.persons
+        state = self.state_at(last)
+        first.first_name = "Changed"
+        first.save(username=self.user.username)
+        self.assertEqual(DemographicSource().covered(self.LABEL, [p.id for p in self.persons], state),
+                         {middle.id, last.id})
+
+    def test_a_subject_on_the_cursor_time_is_covered_up_to_the_cursor_id(self):
+        first, middle, last = self.persons
+        state = ScanState(kind="demographic", updated_at=middle.date_updated, last_id="",
+                          last_scan_at=datetime.now())
+        self.assertEqual(DemographicSource().covered(self.LABEL, [p.id for p in self.persons], state), {first.id})
+
+    def test_an_empty_cursor_or_no_state_covers_nobody(self):
+        ids = [person.id for person in self.persons]
+        empty = ScanState(kind="demographic", updated_at=None, last_id="", last_scan_at=datetime.now())
+        self.assertEqual(DemographicSource().covered(self.LABEL, ids, empty), set())
+        self.assertEqual(DemographicSource().covered(self.LABEL, ids, None), set())
+
+    def test_ids_come_back_as_passed(self):
+        state = self.state_at(self.persons[-1])
+        as_text = [str(person.id) for person in self.persons]
+        self.assertEqual(DemographicSource().covered(self.LABEL, as_text, state), set(as_text))
+        self.assertEqual(DemographicSource().covered(self.LABEL, [], state), set())
+
+    def test_an_unknown_id_is_not_covered(self):
+        state = ScanState(kind="demographic", updated_at=datetime.now() + timedelta(days=1), last_id="",
+                          last_scan_at=datetime.now())
+        unknown = "00000000-0000-0000-0000-000000000000"
+        self.assertEqual(DemographicSource().covered(self.LABEL, [unknown, self.persons[0].id], state),
+                         {self.persons[0].id})

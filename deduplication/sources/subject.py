@@ -1,4 +1,4 @@
-from typing import Optional, Set
+from typing import Iterable, Optional, Set
 
 from django.apps import apps
 from django.db.models import Q
@@ -43,3 +43,17 @@ def touched_ids(model, since: Optional[Watermark]) -> Optional[Set[str]]:
         q |= Q(id__gt=since.last_id)
 
     return set(str(i) for i in model.objects.filter(q).values_list("id", flat=True))
+
+
+def subject_covered(subject_model: str, subject_ids: Iterable, state) -> Set:
+    """The ids among ``subject_ids``, as passed, whose subject's ``(date_updated, id)`` is at or before the
+    cursor of ``state`` (a ScanState row). An empty cursor, or no state, covers nobody."""
+    by_key = {str(subject_id): subject_id for subject_id in subject_ids}
+    if state is None or state.updated_at is None or not by_key:
+        return set()
+    rows = apps.get_model(subject_model).objects.filter(id__in=list(by_key)).values_list("id", "date_updated")
+    return {
+        by_key[str(subject_id)]
+        for subject_id, updated in rows
+        if updated < state.updated_at or (updated == state.updated_at and str(subject_id) <= state.last_id)
+    }
