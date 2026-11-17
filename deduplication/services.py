@@ -27,6 +27,7 @@ from deduplication.sources import Candidate, Watermark, order_pair, sources as r
     without_left_out
 from deduplication.validations import CreateDeduplicationReviewTasksValidation, \
     CreateDeduplicationPaymentReviewTasksValidation
+from deduplication.sources.snapshot import ReadSnapshot
 from individual.data_masking import may_see_masked
 from individual.models import Individual
 from invoice.models import Bill, BillItem
@@ -642,10 +643,11 @@ def _scan_source(source) -> int:
     state, _created = ScanState.objects.select_for_update().get_or_create(kind=source.kind)
     since = None
     if state.updated_at is not None or state.last_id:
-        since = Watermark(updated_at=state.updated_at, last_id=state.last_id or None)
+        since = Watermark(updated_at=state.updated_at, last_id=state.last_id or None,
+                          snapshot=ReadSnapshot.of(state))
 
-    # Taken before scanning: a subject written while the scan iterates is newer than this
-    # cursor, so the next scan revisits it; record_candidate makes the revisit harmless.
+    # Taken before scanning: a row committed after its snapshot, whatever its date_updated, is
+    # not read by it, so the next scan revisits it; record_candidate makes the revisit harmless.
     new_watermark = source.watermark()
     count = 0
     for candidate in without_left_out(source.scan(since)):
@@ -656,6 +658,8 @@ def _scan_source(source) -> int:
     state.last_id = new_watermark.last_id or ""
     state.last_scan_at = datetime.now()
     state.summary = {'count': count}
+    if new_watermark.snapshot is not None:
+        state.summary['snapshot'] = new_watermark.snapshot.as_json()
     state.save()
     return count
 

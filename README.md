@@ -45,15 +45,18 @@ is not checked), or when a hook refuses the write. A refused merge rolls back wh
 feed duplicate-subject candidates into this module, without a hard dependency in either
 direction:
 
-- `Watermark(updated_at, last_id)` — a scan cursor.
+- `Watermark(updated_at, last_id, snapshot)` — a scan cursor. `snapshot` (`ReadSnapshot`,
+  `deduplication/sources/snapshot.py`) records which row versions of the source's table the scan
+  read; a cursor without one cannot tell a row committed after its scan from a row it read.
 - `Candidate(subject_model, subject_a, subject_b, kind, score, evidence)` — one suspected
   duplicate pair; `subject_a < subject_b` as strings, `kind` identifies the detector
   (`"demographic"`, `"identifier"`, `"biometric"`, or any other registered kind).
 - `CandidateSource` — ABC with `scan(since)` and `watermark()`, and `covered(subject_model, subject_ids,
   state)`, which returns the ids among `subject_ids`, as passed, that the source's last scan covered,
   `state` being its `ScanState` row. The default is the rule of the subject sources: a subject is covered
-  when its `(date_updated, id)` is at or before the cursor; an empty cursor covers nobody. A source whose
-  cursor is not a subject's (`biometric`) overrides it.
+  when its `(date_updated, id)` is at or before the cursor and the scan's snapshot read its current
+  version; an empty cursor covers nobody, and a state without a snapshot applies the cursor alone. A
+  source whose cursor is not a subject's (`biometric`) overrides it.
 - `register(source)` / `sources()` — a process-wide registry, in registration order.
 - `order_pair(a, b)` — sorts two subject ids into the canonical `(a, b)` order.
 - `register_subject_filter(key, subject_filter)` — registers
@@ -135,6 +138,39 @@ Services (`deduplication/services.py`):
   `task.json_ext["additional_resolve_data"]` (`{"decision", "keep", "note"}`); when the
   completing user may not see the candidate, the completion is refused
   (`deduplication.resolve.candidate_out_of_scope`).
+
+## Scan cursor
+
+A row's `date_updated` is stamped when it is saved, not when its transaction commits, so a
+row can commit after a scan with a stamp before that scan's cursor. A scan therefore also
+keeps, in `ScanState.summary["snapshot"]`, a `ReadSnapshot` of the source's table, taken
+before it reads anything:
+
+- `xmin`: the lowest PostgreSQL transaction id still running, other than the scan's own
+  transaction, or the scan's own transaction id when that is lower. Every row version with a
+  lower transaction id was committed (or rolled back) before the scan read anything.
+- `seen`: the versions (`"xmin:ctid"`) already visible with an id at or above `xmin`,
+  including the versions the scan's own transaction wrote before it; at most
+  `SEEN_LIMIT` (10 000) of them.
+- `system`: the database cluster's system identifier.
+
+A row version is read by the scan when its transaction id is below `xmin` or it is in
+`seen`, in the same cluster. The next scan of the source revisits every row whose current
+version that scan did not read, as well as every row past the `(date_updated, id)` cursor,
+however long the writing transaction ran. A subject source covers a subject only when the
+last scan read its current version and its `(date_updated, id)` is at or before the cursor.
+
+- A version beyond `SEEN_LIMIT`, or written after the snapshot by the scan's own
+  transaction, counts as not read: its row is scanned again and covers nobody until a later
+  scan reads it.
+- A snapshot of another cluster (the database restored elsewhere) reads nothing: the next
+  scan revisits every row and nobody is covered until it completes.
+- A cursor kept without a snapshot (a `ScanState` written before snapshots were kept) makes
+  the next scan of the source revisit every row; until that scan, coverage follows the
+  `(date_updated, id)` cursor alone.
+- A transaction id is unwrapped from its 32-bit `xmin` against the current one: a row
+  version frozen more than 2^31 transactions ago can read as recent, and then counts as
+  read only through `seen`.
 
 ## Merge policy
 
