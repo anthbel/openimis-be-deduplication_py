@@ -2,11 +2,14 @@
 duplication summary. Each column is a field lookup or a json_ext key of the model it is read on, as
 ``column_resolution.resolve_columns`` splits them; both readings are checked."""
 import copy
+import logging
 
 from django.apps import apps
 
 from core.data_masking import DataMaskAbs, MaskingClassStorage
-from individual.data_masking import MASK_PLACEHOLDER, IndividualMask, reads_masked_field
+from individual.data_masking import MASK_PLACEHOLDER, IndividualMask, may_see_masked, order_lookups, reads_masked_field
+
+logger = logging.getLogger(__name__)
 
 JSON_EXT = "json_ext"
 JSON_LOOKUP = JSON_EXT + "__"
@@ -104,3 +107,21 @@ def summary_review_task_masker(model):
         return task
 
     return mask
+
+
+def unmasked_candidate_order_by(user, model, order_by):
+    """``order_by`` less its terms ordering by a candidate's evidence, for a user without the masked-data right:
+    the evidence holds person values, so such an ordering would tell the masked ones. The primary key orders
+    last, so the order stays total and pages neither repeat nor skip rows."""
+    if not order_by:
+        return order_by
+    terms = [order_by] if isinstance(order_by, str) else list(order_by)
+    kept = terms if may_see_masked(user) else [
+        term for term in terms if not any(lookup.split("__")[0] == "evidence" for lookup in order_lookups([term]))]
+    if len(kept) < len(terms):
+        logger.info("orderBy %s of %s left out for a user without the masked-data right",
+                    [term for term in terms if term not in kept], model.__name__)
+    primary_key = model._meta.pk.name
+    if primary_key not in order_lookups(kept):
+        kept = [*kept, primary_key]
+    return kept

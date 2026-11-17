@@ -201,3 +201,49 @@ class SummaryReviewTaskDataMaskingTest(MaskedFieldsMixin, openIMISGraphQLTestCas
                 for values in self._column_values("unmasked", source):
                     self.assertEqual(values,
                                      {"individual__first_name": "Sumfirst", "phone": "+25779000002", "k1": "v1"})
+
+
+CANDIDATE_ORDER_QUERY = """
+query { duplicateCandidates(first: 10, kind: "ordering", orderBy: ["%s"]) { edges { node { id evidence } } } }
+"""
+
+
+class CandidateOrderingTest(MaskedFieldsMixin, openIMISGraphQLTestCase):
+    """An ordering on the candidates' evidence is left out for a user without the masked-data right."""
+
+    @classmethod
+    def setUpTestData(cls):
+        admin = LogInHelper().get_or_create_user_api()
+        cls.tokens = {
+            name: BaseTestContext(user=create_right_only_user(f"ddo_{name}", perms)).get_jwt()
+            for name, perms in (("duplicates", ["gql_query_duplicates_perms"]),
+                                ("dup_unmasked", ["gql_query_duplicates_perms", UNMASK]))}
+        candidates = []
+        for _ in range(2):
+            a = Individual(first_name="Order", last_name="Clearlast", dob="1990-01-01")
+            a.save(username=admin.username)
+            b = Individual(first_name="Order", last_name="Clearlast", dob="1990-01-01")
+            b.save(username=admin.username)
+            subject_a, subject_b = order_pair(str(a.id), str(b.id))
+            candidates.append(DuplicateCandidate.objects.create(
+                subject_model="individual.Individual", subject_a=subject_a, subject_b=subject_b,
+                kind="ordering", source="TestSource", evidence={}))
+        cls.by_id = sorted(candidates, key=lambda candidate: str(candidate.id))
+        for candidate, name in zip(cls.by_id, ("Zelda", "Abel")):
+            candidate.evidence = {"columns": {"first_name": name}}
+            candidate.save()
+
+    def _ids(self, name, order):
+        response = self.query(CANDIDATE_ORDER_QUERY % order,
+                              headers={"HTTP_AUTHORIZATION": f"Bearer {self.tokens[name]}"})
+        self.assertResponseNoErrors(response)
+        edges = json.loads(response.content)["data"]["duplicateCandidates"]["edges"]
+        return [graphene.relay.Node.from_global_id(edge["node"]["id"])[1] for edge in edges]
+
+    def test_an_ordering_on_the_evidence_is_left_out_without_the_masked_data_right(self):
+        self.assertEqual(self._ids("duplicates", "evidence__columns__first_name"),
+                         [str(candidate.id) for candidate in self.by_id])
+
+    def test_an_ordering_on_the_evidence_applies_with_the_masked_data_right(self):
+        self.assertEqual(self._ids("dup_unmasked", "evidence__columns__first_name"),
+                         [str(candidate.id) for candidate in reversed(self.by_id)])

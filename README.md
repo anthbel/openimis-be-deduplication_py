@@ -85,6 +85,9 @@ summary row they were made from in `data.column_values`; maskers registered for 
 each value whose column reads a masked field, by the rule of the summaries, on the task, its node
 and its history.
 
+For a user without the masked-data right, an `orderBy` term of `duplicateCandidates` ordering by
+the evidence is left out (logged at info), and the primary key orders last.
+
 Services (`deduplication/services.py`):
 
 - `record_candidate(candidate, source=...)` — get-or-creates the row; an `OPEN` row keeps

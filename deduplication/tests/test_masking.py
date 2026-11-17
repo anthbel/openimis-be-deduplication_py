@@ -4,7 +4,6 @@ from unittest import mock
 
 import graphene
 
-from core.data_masking import MaskingClassStorage
 from core.models.openimis_graphql_test_case import BaseTestContext, openIMISGraphQLTestCase
 from core.test_helpers import create_right_only_user
 from deduplication.models import DuplicateCandidate
@@ -55,8 +54,10 @@ PERSON_COLUMN_FORMS = ["phone", "json_ext__phone", "json_ext", "first_name", "in
 
 
 def beneficiary_mask_off(test):
-    """Turns social_protection's own beneficiary mask off, so only the person's mask applies."""
-    patcher = mock.patch.object(MaskingClassStorage.get_masking_class("Beneficiary"), "masking_enabled", False)
+    """Turns social_protection's own beneficiary mask fields off, so only the person's mask applies."""
+    from social_protection.apps import SocialProtectionConfig
+
+    patcher = mock.patch.object(SocialProtectionConfig, "social_protection_masking_enabled", False)
     patcher.start()
     test.addCleanup(patcher.stop)
 

@@ -17,10 +17,22 @@ from deduplication.gql_queries import (
     DuplicateCandidateGQLType,
     DuplicateCandidateResolveCheckGQLType,
 )
-from deduplication.masking import mask_summary_values
+from deduplication.masking import mask_summary_values, unmasked_candidate_order_by
 from deduplication.models import DuplicateCandidate
 from deduplication.services import ResolveRefusal, check_resolve
 from individual.data_masking import may_see_masked
+
+
+class MaskedCandidateConnectionField(OrderedDjangoFilterConnectionField):
+    """Core's ordered connection leaving out, for a user without the masked-data right, the ``orderBy`` terms
+    that order by the evidence (``unmasked_candidate_order_by``)."""
+
+    @classmethod
+    def resolve_queryset(cls, connection, iterable, info, args, filtering_args, filterset_class):
+        if args.get("orderBy"):
+            args = {**args, "orderBy": unmasked_candidate_order_by(
+                info.context.user, filterset_class._meta.model, args["orderBy"])}
+        return super().resolve_queryset(connection, iterable, info, args, filtering_args, filterset_class)
 
 
 class Query(graphene.ObjectType):
@@ -33,7 +45,7 @@ class Query(graphene.ObjectType):
     # batch of work.
     module_name = "tasks_management"
 
-    duplicate_candidates = OrderedDjangoFilterConnectionField(
+    duplicate_candidates = MaskedCandidateConnectionField(
         DuplicateCandidateGQLType,
         orderBy=graphene.List(of_type=graphene.String),
         status=graphene.String(),

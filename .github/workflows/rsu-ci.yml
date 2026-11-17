@@ -6,8 +6,9 @@ on:
     branches: [rsu/26.10]
   workflow_dispatch:
 
-# Runs the module's tests on the openIMIS release/26.10 assembly, with the individual module taken
-# from the anthbel fork (rsu/26.10), restricted to the modules it needs, on the openIMIS database image.
+# Runs the module's tests on the openIMIS release/26.10 assembly, with the individual, tasks_management
+# and social_protection modules taken from the anthbel forks (rsu/26.10), restricted to the modules it
+# needs, on the openIMIS database image.
 
 jobs:
   test:
@@ -30,8 +31,8 @@ jobs:
     env:
       ASSEMBLY_REF: release/26.10
       MODULE_NAME: deduplication
-      BASE_MODULES: core workflow tasks_management location medical medical_pricelist calculation contribution_plan social_protection payment_cycle invoice calcrule_social_protection payroll
-      EXTRA_MODULES: "individual"
+      BASE_MODULES: core workflow location medical medical_pricelist calculation contribution_plan payment_cycle invoice calcrule_social_protection payroll
+      EXTRA_MODULES: "individual tasks_management social_protection"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -41,6 +42,16 @@ jobs:
           repository: anthbel/openimis-be-individual_py
           ref: rsu/26.10
           path: dep-individual
+      - uses: actions/checkout@v7
+        with:
+          repository: anthbel/openimis-be-tasks_management_py
+          ref: rsu/26.10
+          path: dep-tasks_management
+      - uses: actions/checkout@v7
+        with:
+          repository: anthbel/openimis-be-social_protection_py
+          ref: rsu/26.10
+          path: dep-social_protection
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
