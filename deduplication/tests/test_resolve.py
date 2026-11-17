@@ -465,9 +465,10 @@ class ResolveMovesOpenPairsOfTheRetiredSubjectTest(TestCase):
         with self.assertRaisesMessage(ValueError, "deduplication.resolve.pair_changed"):
             resolve(read, decision="different", actor=self.user)
 
-    def test_the_moved_candidates_are_locked_after_the_merged_one_in_id_order(self):
-        self._candidate(self.retired, self.other)
-        self._candidate(self.kept, self.other)
+    def test_the_merged_candidate_its_pair_and_the_moved_candidates_are_locked_in_one_statement_in_id_order(self):
+        sibling = self._candidate(self.kept, self.retired, kind="identifier")
+        stale = self._candidate(self.retired, self.other)
+        target = self._candidate(self.kept, self.other)
         table = DuplicateCandidate._meta.db_table
 
         with CaptureQueriesContext(connection) as ctx:
@@ -475,5 +476,8 @@ class ResolveMovesOpenPairsOfTheRetiredSubjectTest(TestCase):
 
         locks = [query["sql"] for query in ctx.captured_queries
                  if "FOR UPDATE" in query["sql"] and f'FROM "{table}"' in query["sql"]]
-        self.assertEqual(len(locks), 3, locks)
-        self.assertIn('ORDER BY "deduplication_candidate"."id" ASC', locks[2])
+        self.assertEqual(len(locks), 1, locks)
+        self.assertIn('ORDER BY "deduplication_candidate"."id" ASC', locks[0])
+        for row in (self.merged, stale, target):
+            self.assertIn(str(row.id).replace("-", ""), locks[0].replace("-", ""))
+        self.assertIn(f"\"subject_a\" = '{sibling.subject_a}'", locks[0])

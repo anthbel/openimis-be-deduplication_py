@@ -315,7 +315,9 @@ higher score and merges evidence: `evidence["columns"]` becomes the union of the
 the incoming columns, so a pair matched on several identifier keys keeps every matched key; on
 any other evidence key the incoming value wins. Both are written by an `UPDATE` filtered on
 `status = OPEN`, so a row another transaction resolved since the scan read it keeps its decision.
-Returns `(row, created)`.
+The `UPDATE` takes the row through `SELECT … FOR UPDATE SKIP LOCKED`: a row a `resolve` holds is skipped,
+so a scan never waits on a candidate row. The skipped rescoring is written by a later scan that reads the
+pair again. Returns `(row, created)`.
 
 ```python
 run_scan(*, kinds: list[str] | None = None, actor: str) -> dict   # counts per kind
@@ -347,7 +349,9 @@ and error id, after the other sources' candidates are recorded.
 resolve(candidate, *, decision: "same"|"different", keep: str | None = None, actor, note="")
 ```
 `resolve` runs in one transaction that first locks both subject rows (`SELECT … FOR UPDATE`,
-one row at a time, in sorted id order), then the candidate row, before any check. Two resolves
+one row at a time, in sorted id order), then, in one statement in id order, the candidate, the other
+candidates of its pair and, for `same`, the `OPEN` candidates naming the subject to retire with the
+`(kept, other)` candidates of their kinds, before any check. Two resolves
 sharing a subject, such as (A,B) and (A,C) with opposite keeps, therefore run one after the
 other, and the second sees the first one's merge.
 
@@ -381,9 +385,8 @@ refused with `deduplication.resolve.keep_contradicts_merge`. A `different` on a 
 pair already has a `CONFIRMED` sibling is refused with `deduplication.resolve.pair_already_merged`;
 the candidate stays `OPEN`.
 
-A merge leaves no `OPEN` pair naming the subject it deleted. In the merge transaction, after the merged
-candidate and its siblings, every other `OPEN` candidate `(retired, other)` of the subject model is locked
-with the `(kept, other)` candidates of the same kinds, in id order, and:
+A merge leaves no `OPEN` pair naming the subject it deleted. Each other `OPEN` candidate `(retired, other)`
+of the subject model that `resolve` locked with the candidate (above) is, in the merge transaction:
 
 - `other` deleted or missing: left as it is; it names two deleted subjects and holds neither;
 - no `(kept, other)` candidate of its kind: it becomes `(kept, other)` (ordered by `order_pair`), keeps

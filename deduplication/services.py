@@ -732,7 +732,9 @@ def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, 
     """Get-or-create a DuplicateCandidate for c's unique key; never reopens a dismissed or confirmed row.
 
     The score and evidence of an existing row are written by an UPDATE filtered on status OPEN, so a row
-    resolved by another transaction since it was read keeps its decision."""
+    resolved by another transaction since it was read keeps its decision. The UPDATE skips a row another
+    transaction holds locked (a resolve), so a scan never waits on a candidate row: that rescoring is not
+    written, and a later scan that reads the pair again writes it."""
     subject_a, subject_b = order_pair(c.subject_a, c.subject_b)
     obj, created = DuplicateCandidate.objects.get_or_create(
         subject_model=c.subject_model, subject_a=subject_a, subject_b=subject_b, kind=c.kind,
@@ -752,9 +754,12 @@ def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, 
         obj.evidence = merged_evidence
         changed = True
     if changed:
-        DuplicateCandidate.objects.filter(pk=obj.pk, status=DuplicateCandidate.Status.OPEN).update(
-            score=obj.score, evidence=obj.evidence, date_updated=datetime.now(),
-        )
+        with transaction.atomic():
+            free = DuplicateCandidate.objects.filter(pk=obj.pk, status=DuplicateCandidate.Status.OPEN) \
+                .select_for_update(skip_locked=True).values('pk')
+            DuplicateCandidate.objects.filter(pk__in=free).update(
+                score=obj.score, evidence=obj.evidence, date_updated=datetime.now(),
+            )
     return obj, False
 
 
@@ -1033,10 +1038,14 @@ def _pair_candidates(candidate: DuplicateCandidate):
     ).exclude(pk=candidate.pk)
 
 
-def _confirm_open_siblings(candidate: DuplicateCandidate, *, actor, note: str):
-    """Settle the other OPEN kinds of a merged pair with the same decision; dismissed kinds stay."""
+def _confirm_open_siblings(candidate: DuplicateCandidate, rows: dict, *, actor, note: str):
+    """Settle the other OPEN kinds of a merged pair, among the locked ``rows``, with the same decision; dismissed
+    kinds stay."""
     now = datetime.now()
-    for sibling in _pair_candidates(candidate).select_for_update().filter(status=DuplicateCandidate.Status.OPEN):
+    siblings = [row for row in rows.values()
+                if row.pk != candidate.pk and row.status == DuplicateCandidate.Status.OPEN
+                and (row.subject_a, row.subject_b) == (candidate.subject_a, candidate.subject_b)]
+    for sibling in siblings:
         sibling.status = DuplicateCandidate.Status.CONFIRMED
         sibling.reviewed_by = actor.username
         sibling.reviewed_at = now
@@ -1062,10 +1071,35 @@ def _with_move(evidence, move: dict) -> dict:
     return evidence
 
 
-def _move_open_pairs(candidate: DuplicateCandidate, kept, retired, *, actor):
+def _lock_candidates(candidate: DuplicateCandidate, decision: str, keep: Optional[str]) -> dict:
+    """{pk: row}: the candidate, the other candidates of its pair and, for a "same" decision, the OPEN candidates
+    naming the subject to retire with the (kept, other) candidates of their kinds, locked in one statement in id
+    order. A scan skips the rows a resolve holds (record_candidate), so it never waits on them."""
+    ids, model = [candidate.pk], candidate.subject_model
+    keep_id = str(keep) if keep else candidate.subject_a
+    if decision == 'same' and keep_id in (candidate.subject_a, candidate.subject_b):
+        retired_id = candidate.subject_b if keep_id == candidate.subject_a else candidate.subject_a
+        stale = list(DuplicateCandidate.objects.filter(subject_model=model, status=DuplicateCandidate.Status.OPEN)
+                     .filter(Q(subject_a=retired_id) | Q(subject_b=retired_id))
+                     .exclude(subject_a=candidate.subject_a, subject_b=candidate.subject_b)
+                     .values_list('pk', 'subject_a', 'subject_b', 'kind'))
+        targets = Q(pk__in=[])
+        for pk, subject_a, subject_b, kind in stale:
+            low, high = order_pair(keep_id, subject_b if subject_a == retired_id else subject_a)
+            targets |= Q(subject_a=low, subject_b=high, kind=kind)
+            ids.append(pk)
+        if stale:
+            ids += list(DuplicateCandidate.objects.filter(subject_model=model).filter(targets)
+                        .values_list('pk', flat=True))
+    return {row.pk: row for row in DuplicateCandidate.objects.select_for_update().filter(
+        Q(pk__in=ids) | Q(subject_model=model, subject_a=candidate.subject_a, subject_b=candidate.subject_b),
+    ).order_by('pk')}
+
+
+def _move_open_pairs(candidate: DuplicateCandidate, kept, retired, rows: dict, *, actor):
     """
-    After a merge of retired into kept, moves each other OPEN candidate (retired, other) onto kept, so that no
-    OPEN pair names a subject the merge deleted:
+    After a merge of retired into kept, moves each other OPEN candidate (retired, other) among the locked ``rows``
+    onto kept, so that no OPEN pair names a subject the merge deleted:
 
     - other deleted or missing: left as it is, both its subjects being gone;
     - no (kept, other) candidate of its kind: it becomes (kept, other), its evidence naming the merge under
@@ -1073,28 +1107,16 @@ def _move_open_pairs(candidate: DuplicateCandidate, kept, retired, *, actor):
     - an OPEN (kept, other) of its kind: that candidate names it under ``moved_from`` and it is deleted;
     - a DISMISSED (kept, other) of its kind: it is DISMISSED too, kept and retired being one subject.
 
-    The candidates are locked in id order after the merged candidate.
+    A candidate on retired recorded after ``_lock_candidates`` read them is not among ``rows`` and is left.
     """
     kept_id, retired_id = str(kept.id), str(retired.id)
-    model = candidate.subject_model
-    stale = list(DuplicateCandidate.objects.filter(subject_model=model, status=DuplicateCandidate.Status.OPEN)
-                 .filter(Q(subject_a=retired_id) | Q(subject_b=retired_id))
-                 .exclude(subject_a=candidate.subject_a, subject_b=candidate.subject_b))
-    if not stale:
+    moving = [row for row in rows.values() if row.status == DuplicateCandidate.Status.OPEN
+              and retired_id in (row.subject_a, row.subject_b)
+              and (row.subject_a, row.subject_b) != (candidate.subject_a, candidate.subject_b)]
+    if not moving:
         return
-    targets = Q(pk__in=[])
-    for row in stale:
-        low, high = order_pair(kept_id, _other_subject(row, retired_id))
-        targets |= Q(subject_a=low, subject_b=high, kind=row.kind)
-    target_ids = list(DuplicateCandidate.objects.filter(subject_model=model).filter(targets)
-                      .values_list('pk', flat=True))
-    locked = {row.pk: row for row in DuplicateCandidate.objects.select_for_update()
-              .filter(pk__in=[row.pk for row in stale] + target_ids).order_by('pk')}
-    moving = [locked[row.pk] for row in stale if row.pk in locked
-              and locked[row.pk].status == DuplicateCandidate.Status.OPEN
-              and retired_id in (locked[row.pk].subject_a, locked[row.pk].subject_b)]
-    gone = _subjects_gone(model, {_other_subject(row, retired_id) for row in moving})
-    by_pair = {(row.subject_a, row.subject_b, row.kind): row for row in locked.values()}
+    gone = _subjects_gone(candidate.subject_model, {_other_subject(row, retired_id) for row in moving})
+    by_pair = {(row.subject_a, row.subject_b, row.kind): row for row in rows.values()}
     now = datetime.now()
     move = {'subject': retired_id, 'kept': kept_id, 'merged_by': str(candidate.pk), 'at': now.isoformat()}
     for row in moving:
@@ -1229,7 +1251,8 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
     """different -> DISMISSED. same -> merge_subjects then CONFIRMED.
 
     For a "same" decision the lock phase of each merge preparer runs first. Both subject
-    rows are then locked, in sorted id order, then the candidate row. A merge runs the
+    rows are then locked, in sorted id order, then in one statement in id order the candidate,
+    the other candidates of its pair and those a merge may move (_lock_candidates). A merge runs the
     preparers' prepare phase before the enrolment guard, and skips the fill when one of
     them answers fill=False; a MergeRefusal of either phase is raised as a ResolveRefusal.
     Only an OPEN candidate is resolved. The row is re-read under a row lock, and a
@@ -1257,7 +1280,8 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
         locked = _lock_for_preparers(candidate, keep) if decision == 'same' else []
         pair = (candidate.subject_a, candidate.subject_b)
         _lock_subjects(candidate.subject_model, pair)
-        candidate = DuplicateCandidate.objects.select_for_update().filter(pk=candidate.pk).first()
+        rows = _lock_candidates(candidate, decision, keep)
+        candidate = rows.get(candidate.pk)
         if candidate is None or (candidate.subject_a, candidate.subject_b) != pair:
             raise ResolveRefusal("deduplication.resolve.pair_changed")
         if candidate.status != DuplicateCandidate.Status.OPEN:
@@ -1275,9 +1299,9 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
         candidate.decision_note = note
         candidate.save()
         if candidate.status == DuplicateCandidate.Status.CONFIRMED:
-            _confirm_open_siblings(candidate, actor=actor, note=note)
+            _confirm_open_siblings(candidate, rows, actor=actor, note=note)
         if plan.merge:
-            _move_open_pairs(candidate, plan.kept, plan.retired, actor=actor)
+            _move_open_pairs(candidate, plan.kept, plan.retired, rows, actor=actor)
     return candidate
 
 
