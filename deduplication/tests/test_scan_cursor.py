@@ -3,8 +3,11 @@ the next scan and is not covered until then."""
 import threading
 from datetime import datetime, timedelta
 
+from unittest import mock
+
 from django.db import connection, connections, transaction
 from django.test import TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 
 from deduplication.models import DuplicateCandidate, ScanState
 from deduplication.services import run_scan
@@ -158,10 +161,100 @@ class ReadSnapshotTest(TestCase):
         self.assertEqual(DemographicSource().covered(PERSON, [self.persons[0].id], state), set())
         since = Watermark(updated_at=state.updated_at, last_id=state.last_id,
                           snapshot=ReadSnapshot.of(state))
-        self.assertTrue({str(person.id) for person in self.persons} <= touched_ids(Individual, since))
+        self.assertIsNone(touched_ids(Individual, since))
 
     def test_a_cursor_without_a_snapshot_scans_everything(self):
         later = datetime.now() + timedelta(days=1)
         self.assertIsNone(touched_ids(Individual, Watermark(updated_at=later, last_id="")))
         ScanState.objects.create(kind="demographic", updated_at=later, last_id="", last_scan_at=datetime.now())
         self.assertEqual(self.scan()[0], 1)
+
+    def test_a_state_without_a_snapshot_covers_nobody(self):
+        _count, state = self.scan()
+        ids = [person.id for person in self.persons]
+        state.summary.pop("snapshot")
+        self.assertEqual(DemographicSource().covered(PERSON, ids, state), set())
+
+    def test_the_versions_read_are_never_sent_as_an_array_to_compare_each_row_with(self):
+        _count, state = self.scan()
+        Individual.objects.filter(id=self.persons[0].id).update(first_name="Rose")
+        from deduplication.sources.snapshot import ReadSnapshot
+
+        since = Watermark(updated_at=state.updated_at, last_id=state.last_id, snapshot=ReadSnapshot.of(state))
+        self.assertTrue(ReadSnapshot.of(state).seen)
+        with CaptureQueriesContext(connection) as queries:
+            self.assertEqual(touched_ids(Individual, since), {str(self.persons[0].id)})
+            DemographicSource().covered(PERSON, [person.id for person in self.persons], state)
+        for query in queries.captured_queries:
+            sql = " ".join(query["sql"].upper().split())
+            self.assertNotIn("ANY(", sql.replace("ANY (", "ANY("))
+            self.assertNotIn("<> ALL", sql)
+
+    def test_a_snapshot_leaving_versions_out_logs_how_many_and_the_age_of_the_oldest_transaction(self):
+        from deduplication.sources import snapshot as snapshots
+
+        with mock.patch.object(snapshots, "SEEN_LIMIT", 1), \
+                self.assertLogs("deduplication.sources.snapshot", "WARNING") as logs:
+            taken = snapshots.ReadSnapshot.take(Individual.objects.filter(last_name=LAST_NAME))
+        self.assertEqual(len(taken.seen), 1)
+        self.assertEqual(len(logs.records), 1)
+        message = logs.records[0].getMessage()
+        self.assertIn(": 2 row versions written since the oldest running transaction", message)
+        self.assertRegex(message, r"started \d+ transaction ids ago")
+        for person in self.persons:
+            self.assertNotIn(person.first_name, message)
+            self.assertNotIn(str(person.id), message)
+
+
+class TransactionIdRuleTest(TestCase):
+    """The unwrap of a 32-bit xmin and the rule that a version counts as old, on literal ids."""
+
+    EPOCH = 2 ** 32
+
+    def unwrapped(self, raw, xmax):
+        from deduplication.sources.snapshot import unwrapped
+
+        with connection.cursor() as cursor:
+            cursor.execute(f"SELECT {unwrapped('v.raw', 'v.xmax')} "
+                           "FROM (VALUES (%s::bigint, %s::bigint)) AS v(raw, xmax)", [raw, xmax])
+            return cursor.fetchone()[0]
+
+    def old(self, transaction_id, xmin, xmax, own):
+        from deduplication.sources.snapshot import old, unwrapped
+
+        rule = old(unwrapped("v.raw", "v.xmax"), "v.xmin", "v.xmax", "v.own")
+        with connection.cursor() as cursor:
+            cursor.execute(f"SELECT {rule} FROM (VALUES (%s::bigint, %s::bigint, %s::bigint, %s::bigint)) "
+                           "AS v(raw, xmin, xmax, own)", [transaction_id % self.EPOCH, xmin, xmax, own])
+            return cursor.fetchone()[0]
+
+    def test_an_id_within_2_31_of_xmax_unwraps_to_itself_across_an_epoch(self):
+        xmax = 3 * self.EPOCH + 100
+        for transaction_id in (xmax - 5, xmax - 200, xmax + 3, xmax - 2 ** 31 + 1, xmax + 2 ** 31 - 1):
+            with self.subTest(transaction_id=transaction_id):
+                self.assertEqual(self.unwrapped(transaction_id % self.EPOCH, xmax), transaction_id)
+
+    def test_an_id_more_than_2_31_behind_unwraps_into_the_future(self):
+        xmax = 3 * self.EPOCH + 100
+        ancient = xmax - 3_000_000_000
+        self.assertEqual(self.unwrapped(ancient % self.EPOCH, xmax), ancient + self.EPOCH)
+
+    def test_old_below_xmin_and_not_old_between_xmin_and_xmax(self):
+        xmax, xmin = 3 * self.EPOCH + 100, 3 * self.EPOCH + 50
+        self.assertTrue(self.old(xmin - 1, xmin, xmax, None))
+        self.assertFalse(self.old(xmin, xmin, xmax, None))
+        self.assertFalse(self.old(xmax - 1, xmin, xmax, xmin + 10))
+
+    def test_a_frozen_id_unwrapped_into_the_future_is_old_unless_at_or_above_the_own_transaction(self):
+        xmax, xmin = 3 * self.EPOCH + 100, 3 * self.EPOCH + 50
+        ancient = xmax - 3_000_000_000
+        self.assertTrue(self.old(ancient, xmin, xmax, None))
+        self.assertTrue(self.old(ancient, xmin, xmax, xmax + 2_000_000_000))
+        self.assertFalse(self.old(ancient, xmin, xmax, xmax + 1))
+
+    def test_the_own_transaction_at_or_above_xmax_is_not_old(self):
+        xmax, xmin = 3 * self.EPOCH + 100, 3 * self.EPOCH + 50
+        own = xmax + 2
+        self.assertFalse(self.old(own, xmin, xmax, own))
+        self.assertFalse(self.old(own + 5, xmin, xmax, own))
+        self.assertTrue(self.old(xmax + 1, xmin, xmax, own))

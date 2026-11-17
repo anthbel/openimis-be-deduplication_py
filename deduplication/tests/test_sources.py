@@ -8,6 +8,7 @@ from deduplication.models import ScanState
 from deduplication.sources import order_pair, sources
 from deduplication.sources.demographic import DemographicSource
 from deduplication.sources.identifier import IdentifierSource
+from deduplication.sources.snapshot import ReadSnapshot
 from deduplication.tests.data.dedup_candidates import individuals_data
 from deduplication.tests.helpers import LogInHelper, override_deduplication_config
 from individual.models import Individual
@@ -208,7 +209,7 @@ class DemographicSourceNullGroupingTest(TestCase):
 
 class SubjectSourceCoverageTest(TestCase):
     """covered() of the subject sources: a subject is covered when its (date_updated, id) is at or before the
-    source's cursor; an empty cursor covers nobody."""
+    source's cursor and the scan's snapshot read it; an empty cursor covers nobody."""
 
     LABEL = "individual.Individual"
 
@@ -224,7 +225,12 @@ class SubjectSourceCoverageTest(TestCase):
 
     def state_at(self, person):
         return ScanState(kind="demographic", updated_at=person.date_updated, last_id=str(person.id),
-                         last_scan_at=datetime.now())
+                         last_scan_at=datetime.now(), summary=self.snapshot())
+
+    @staticmethod
+    def snapshot():
+        """The summary of a scan whose snapshot read every person written so far."""
+        return {"snapshot": ReadSnapshot.take(Individual.objects.all()).as_json()}
 
     def test_subjects_at_or_before_the_cursor_are_covered(self):
         first, middle, last = self.persons
@@ -245,7 +251,7 @@ class SubjectSourceCoverageTest(TestCase):
     def test_a_subject_on_the_cursor_time_is_covered_up_to_the_cursor_id(self):
         first, middle, last = self.persons
         state = ScanState(kind="demographic", updated_at=middle.date_updated, last_id="",
-                          last_scan_at=datetime.now())
+                          last_scan_at=datetime.now(), summary=self.snapshot())
         self.assertEqual(DemographicSource().covered(self.LABEL, [p.id for p in self.persons], state), {first.id})
 
     def test_an_empty_cursor_or_no_state_covers_nobody(self):
@@ -262,7 +268,7 @@ class SubjectSourceCoverageTest(TestCase):
 
     def test_an_unknown_id_is_not_covered(self):
         state = ScanState(kind="demographic", updated_at=datetime.now() + timedelta(days=1), last_id="",
-                          last_scan_at=datetime.now())
+                          last_scan_at=datetime.now(), summary=self.snapshot())
         unknown = "00000000-0000-0000-0000-000000000000"
         self.assertEqual(DemographicSource().covered(self.LABEL, [unknown, self.persons[0].id], state),
                          {self.persons[0].id})
