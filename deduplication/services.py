@@ -1,5 +1,6 @@
 import copy
 import logging
+import uuid
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Union, Tuple, Type
@@ -551,7 +552,10 @@ def _merge_evidence(current: dict, incoming: dict) -> dict:
 
 
 def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, bool]:
-    """Get-or-create a DuplicateCandidate for c's unique key; never reopens a dismissed row."""
+    """Get-or-create a DuplicateCandidate for c's unique key; never reopens a dismissed or confirmed row.
+
+    The score and evidence of an existing row are written by an UPDATE filtered on status OPEN, so a row
+    resolved by another transaction since it was read keeps its decision."""
     subject_a, subject_b = order_pair(c.subject_a, c.subject_b)
     obj, created = DuplicateCandidate.objects.get_or_create(
         subject_model=c.subject_model, subject_a=subject_a, subject_b=subject_b, kind=c.kind,
@@ -571,7 +575,9 @@ def record_candidate(c: Candidate, *, source: str) -> Tuple[DuplicateCandidate, 
         obj.evidence = merged_evidence
         changed = True
     if changed:
-        obj.save()
+        DuplicateCandidate.objects.filter(pk=obj.pk, status=DuplicateCandidate.Status.OPEN).update(
+            score=obj.score, evidence=obj.evidence, date_updated=datetime.now(),
+        )
     return obj, False
 
 
@@ -599,13 +605,22 @@ def _scan_source(source) -> int:
     return count
 
 
+def scan_error(what: str, exc: Exception) -> str:
+    """Logs ``exc`` with its text under a new error id and returns "<error class> (error id <id>)". The text of a
+    scan error can quote a subject's values, so only this summary is returned, printed or stored."""
+    error_id = uuid.uuid4().hex
+    logger.error("%s (error id %s)", what, error_id, exc_info=exc)
+    return f"{type(exc).__name__} (error id {error_id})"
+
+
 def run_scan(*, kinds: Optional[List[str]] = None, actor) -> Dict[str, Union[int, Dict[str, str]]]:
     """
     Scan registered sources (optionally filtered by kind), record candidates, advance watermarks.
 
     Returns {kind: count} for the sources that completed. Each source runs in its own
     transaction: a failing source is logged, its candidates and watermark are rolled back,
-    and the other sources still run. Failures are returned under "failed" as {kind: error};
+    and the other sources still run. Failures are returned under "failed" as {kind: "<error class> (error id
+    <id>)"}, the error's text being logged under that id only;
     the key is present only when a source failed.
     """
     counts = {}
@@ -617,8 +632,7 @@ def run_scan(*, kinds: Optional[List[str]] = None, actor) -> Dict[str, Union[int
             with transaction.atomic():
                 counts[source.kind] = _scan_source(source)
         except Exception as exc:
-            logger.error("Duplicate scan of source %s failed", source.kind, exc_info=exc)
-            failed[source.kind] = str(exc)
+            failed[source.kind] = scan_error(f"Duplicate scan of source {source.kind} failed", exc)
             _record_scan_failure(source.kind, exc)
     if failed:
         counts['failed'] = failed

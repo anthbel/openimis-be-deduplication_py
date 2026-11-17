@@ -306,10 +306,12 @@ The existing beneficiary/payment summary queries and their task flow are **untou
 ```python
 record_candidate(c: Candidate, *, source: str) -> tuple[DuplicateCandidate, bool]
 ```
-`get_or_create` on the unique key. A `DISMISSED` row is never reopened. An `OPEN` row keeps the
+`get_or_create` on the unique key. A `DISMISSED` or `CONFIRMED` row is never reopened. An `OPEN` row keeps the
 higher score and merges evidence: `evidence["columns"]` becomes the union of the recorded and
 the incoming columns, so a pair matched on several identifier keys keeps every matched key; on
-any other evidence key the incoming value wins. Returns `(row, created)`.
+any other evidence key the incoming value wins. Both are written by an `UPDATE` filtered on
+`status = OPEN`, so a row another transaction resolved since the scan read it keeps its decision.
+Returns `(row, created)`.
 
 ```python
 run_scan(*, kinds: list[str] | None = None, actor: str) -> dict   # counts per kind
@@ -323,15 +325,17 @@ the next scan; `record_candidate` is idempotent, so the revisit is harmless.
 Each source runs in its own transaction. A source that raises is logged, its candidates and its
 `ScanState` watermark are rolled back, and the other sources still run. The returned dict holds
 `{kind: count}` for the sources that completed and, only when a source failed,
-`"failed": {kind: error}`. The failure is also recorded on the source's `ScanState.summary` as
+`"failed": {kind: "<error class> (error id <id>)"}`. The error's text, which can quote a subject's
+values, is logged with that error id only; it is never returned, printed, or written to the mutation log
+or the `ScanState` row. The failure is also recorded on the source's `ScanState.summary` as
 `"last_failure": {"at", "error_class"}` (the class name of the error), in its own transaction after the
 rollback; a row created for it has no cursor and no `last_scan_at`, and an existing row keeps them. The
 error's text, which can quote a subject's value, goes to the log only. A completed scan replaces the summary,
 which clears `last_failure`. A failure to record it is logged and the other sources still run.
 `scan_duplicates` prints one line per source and exits non-zero
 (`CommandError`) when any source failed; `runDuplicateScan` records the mutation as failed with
-`deduplication.mutation.failed_to_run_scan` and the failed kinds in `detail`, after the other
-sources' candidates are recorded.
+`deduplication.mutation.failed_to_run_scan` and, in `detail`, each failed kind with its error class
+and error id, after the other sources' candidates are recorded.
 
 ```python
 resolve(candidate, *, decision: "same"|"different", keep: str | None = None, actor, note="")

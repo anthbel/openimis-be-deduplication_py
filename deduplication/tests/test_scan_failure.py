@@ -1,8 +1,14 @@
 import logging
+import re
+from io import StringIO
 from unittest import mock
 
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import TestCase
 
+from core.models import MutationLog
+from core.models.openimis_graphql_test_case import BaseTestContext, openIMISGraphQLTestCase
 from deduplication.models import ScanState
 from deduplication.services import run_scan
 from deduplication.sources import Candidate, CandidateSource
@@ -94,3 +100,59 @@ class ScanFailureTest(TestCase):
         self.assertEqual(result["pairs"], 1)
         self.assertIn("quoting", result["failed"])
         self.assertFalse(ScanState.objects.filter(kind="quoting").exists())
+
+
+ERROR_ID = re.compile(r"error id ([0-9a-f]{32})")
+
+
+class ScanFailureTextTest(openIMISGraphQLTestCase):
+    """The text of a failed scan's error goes to the server log only, under an error id; what is returned, printed
+    or stored names the error class and that id (anthbel/openimis-dist-rsu-burundi#51)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = LogInHelper().get_or_create_user_api()
+        cls.token = BaseTestContext(user=cls.user).get_jwt()
+
+    def _sources(self):
+        return mock.patch("deduplication.services.registered_sources", return_value=[_QuotingSource(), _PairSource()])
+
+    def test_run_scan_returns_the_error_class_and_an_error_id_logged_with_the_text(self):
+        with self._sources(), self.assertLogs("deduplication.services", level=logging.ERROR) as logs:
+            result = run_scan(actor=self.user)
+
+        failure = result["failed"]["quoting"]
+        self.assertNotIn(QUOTED_VALUE, failure)
+        self.assertIn("LookupError", failure)
+        error_id = ERROR_ID.search(failure).group(1)
+        logged = "\n".join(logs.output)
+        self.assertIn(error_id, logged)
+        self.assertIn(QUOTED_VALUE, logged)
+        self.assertNotIn(QUOTED_VALUE, str(ScanState.objects.get(kind="quoting").summary))
+
+    def test_the_command_prints_and_raises_no_error_text(self):
+        out = StringIO()
+        with self._sources(), self.assertLogs("deduplication.services", level=logging.ERROR):
+            with self.assertRaises(CommandError) as raised:
+                call_command("scan_duplicates", "--user", self.user.username, stdout=out, stderr=out)
+
+        self.assertNotIn(QUOTED_VALUE, out.getvalue() + str(raised.exception))
+        self.assertIn("LookupError", out.getvalue())
+
+    def test_the_mutation_log_holds_no_error_text(self):
+        mutation = """
+        mutation RunDuplicateScan($input: RunDuplicateScanMutationInput!) {
+          runDuplicateScan(input: $input) { clientMutationId internalId }
+        }
+        """
+        with self._sources(), self.assertLogs("deduplication.services", level=logging.ERROR):
+            response = self.query(mutation, variables={"input": {"clientMutationId": "scan-quoting"}},
+                                  headers={"HTTP_AUTHORIZATION": f"Bearer {self.token}"})
+        self.assertResponseNoErrors(response)
+
+        log = MutationLog.objects.get(client_mutation_id="scan-quoting")
+        self.assertEqual(log.status, MutationLog.ERROR)
+        self.assertNotIn(QUOTED_VALUE, log.error)
+        self.assertIn("quoting", log.error)
+        self.assertIn("LookupError", log.error)
+        self.assertRegex(log.error, ERROR_ID)

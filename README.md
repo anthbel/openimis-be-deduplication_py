@@ -92,10 +92,12 @@ traverses a JSON field (the evidence, or one reached through a relation such as 
 Services (`deduplication/services.py`):
 
 - `record_candidate(candidate, source=...)` — get-or-creates the row; an `OPEN` row keeps
-  the higher score and merges evidence; a `DISMISSED` row is never reopened.
+  the higher score and merges evidence, written only while the row is still `OPEN`; a `DISMISSED`
+  or `CONFIRMED` row is never reopened.
 - `run_scan(kinds=None, actor=...)` — runs registered sources (optionally filtered by
   kind), records candidates, advances each source's `ScanState`. Also available as
-  `manage.py scan_duplicates [--kind KIND] [--user USERNAME]`.
+  `manage.py scan_duplicates [--kind KIND] [--user USERNAME]`. A failed source is reported, printed and
+  stored by its error class and an error id; the error's text is logged under that id only.
 - `scan_subject(subject_model, subject_id)` — on-demand scan across all sources for one
   subject.
 - `resolve(candidate, decision="same"|"different", keep=None, actor=..., note="")` —

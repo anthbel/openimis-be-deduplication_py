@@ -236,7 +236,8 @@ class RunScanSourceIsolationTest(TestCase):
         self.assertEqual(result["pairs"], 1)
         self.assertNotIn("broken", {k for k, v in result.items() if isinstance(v, int)})
         self.assertIn("broken", result["failed"])
-        self.assertIn("deduplication_no_such_table", result["failed"]["broken"])
+        self.assertNotIn("deduplication_no_such_table", result["failed"]["broken"])
+        self.assertRegex(result["failed"]["broken"], r"^ProgrammingError \(error id [0-9a-f]{32}\)$")
         self.assertTrue(DuplicateCandidate.objects.filter(kind="pairs").exists())
         self.assertFalse(DuplicateCandidate.objects.filter(kind="broken").exists())
 
