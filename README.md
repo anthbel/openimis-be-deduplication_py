@@ -119,10 +119,12 @@ traverses a JSON field (the evidence, or one reached through a relation such as 
 Services (`deduplication/services.py`):
 
 - `record_candidate(candidate, source=...)` — get-or-creates the row; an `OPEN` row keeps
-  the higher score and merges evidence; a `DISMISSED` row is never reopened.
+  the higher score and merges evidence, written only while the row is still `OPEN`; a `DISMISSED`
+  or `CONFIRMED` row is never reopened.
 - `run_scan(kinds=None, actor=...)` — runs registered sources (optionally filtered by
   kind), records candidates, advances each source's `ScanState`. Also available as
-  `manage.py scan_duplicates [--kind KIND] [--user USERNAME]`.
+  `manage.py scan_duplicates [--kind KIND] [--user USERNAME]`. A failed source is reported, printed and
+  stored by its error class and an error id; the error's text is logged under that id only.
 - `scan_subject(subject_model, subject_id)` — on-demand scan across all sources for one
   subject.
 - `resolve(candidate, decision="same"|"different", keep=None, actor=..., note="")` —
@@ -196,6 +198,10 @@ its current version and its `(date_updated, id)` is at or before the cursor.
 - `MERGE_POLICY` (module config `merge_policy`, default `"delete"`) then decides how
   `retired` is retired: `"delete"` soft-deletes it; `"retire"` first sets
   `retired.json_ext["retired_into"] = kept.id`, then soft-deletes it.
+- A merge preparer registered with `deduplication.sources.register_merge_preparer` runs inside `resolve`:
+  its lock phase before the subject locks, its prepare phase before the enrolment guard. It may refuse the
+  merge (`MergeRefusal`, reported with its code) or answer `fill=False`, which leaves `kept` unchanged, with
+  no journal (`docs/wb-biometric-dedup-seam.md`, §4.3).
 - After the transaction commits, the `deduplication.subject_merged` service signal fires
   with `subject_model`, `kept_id`, `retired_id`, `actor`, `policy` (read off
   `kwargs["result"]` by an `AFTER` receiver, the same pattern as this module's other

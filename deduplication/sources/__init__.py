@@ -6,7 +6,7 @@ deduplication, without deduplication importing them back.
 import abc
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set
+from typing import Callable, Dict, FrozenSet, Iterable, Iterator, List, Optional, Set
 
 from deduplication.sources.snapshot import ReadSnapshot
 
@@ -67,6 +67,60 @@ def register(source: CandidateSource) -> None:
 def sources() -> List[CandidateSource]:
     """Registered sources, in registration order."""
     return list(_REGISTRY)
+
+
+class MergeRefusal(Exception):
+    """A merge a preparer refuses; resolve() reports it as a ResolveRefusal with this code and message."""
+
+    def __init__(self, code: str, details: str = "", message: Optional[str] = None):
+        self.code = code
+        self.details = details
+        self.message = message or code
+        super().__init__(f"{code}: {details}" if details else code)
+
+
+@dataclass(frozen=True)
+class MergePlan:
+    """A preparer's answer: ``fill`` False skips the fill of the kept subject and its conflict journal;
+    ``released_group_ids`` are the groups whose membership of the retired subject the preparer ends before the
+    enrolment guard, which a check (no write) then does not count."""
+    fill: bool = True
+    released_group_ids: FrozenSet = frozenset()
+
+
+class MergePreparer(abc.ABC):
+    """Prepares the merges of resolve(), inside its transaction.
+
+    ``lock`` runs before the subject locks, for a "same" decision; its return value is handed to ``prepare`` as
+    ``locked``. ``prepare`` runs after the subject and candidate locks and before the enrolment guard, with
+    ``merge_fields`` naming the fields the fill would copy or journal. check_resolve() calls ``prepare`` alone,
+    with ``check`` True, ``actor`` and ``locked`` None: it must then write nothing. Both raise MergeRefusal to
+    refuse.
+    """
+
+    def lock(self, candidate, keep: Optional[str]):
+        return None
+
+    @abc.abstractmethod
+    def prepare(self, candidate, kept, retired, *, actor, check: bool, locked=None,
+                merge_fields: Iterable[str] = ()) -> MergePlan:
+        raise NotImplementedError
+
+
+_MERGE_PREPARERS: Dict[str, MergePreparer] = {}
+
+
+def register_merge_preparer(key: str, preparer: Optional[MergePreparer]) -> None:
+    """Registers a merge preparer under ``key``; None removes it. Preparers run in key order."""
+    if preparer is None:
+        _MERGE_PREPARERS.pop(key, None)
+    else:
+        _MERGE_PREPARERS[key] = preparer
+
+
+def merge_preparers() -> List[MergePreparer]:
+    """The registered merge preparers, in key order."""
+    return [_MERGE_PREPARERS[key] for key in sorted(_MERGE_PREPARERS)]
 
 
 def order_pair(a: str, b: str):
