@@ -50,14 +50,15 @@ class DuplicateCandidateGQLType(DjangoObjectType):
     @classmethod
     def get_queryset(cls, queryset, info):
         """
-        The queryset when the caller holds gql_query_duplicates_perms. Lookups by relay
-        global id (the root node field) and the reverse connection from a task go through
-        get_queryset, so they check the right the connection resolver checks.
+        The queryset narrowed to the pairs whose two subjects the caller may see
+        (DuplicateCandidate.get_queryset), when the caller holds gql_query_duplicates_perms.
+        The connection, lookups by relay global id (the root node field) and the reverse
+        connection from a task all go through get_queryset.
         """
         user = info.context.user
         if user.is_anonymous or not user.id or not user.has_perms(DeduplicationConfig.gql_query_duplicates_perms):
             raise PermissionDenied(_("unauthorized"))
-        return queryset
+        return DuplicateCandidate.get_queryset(queryset, user)
 
     def resolve_evidence(self, info):
         """The evidence with the values of masked subject fields masked, unless the user may see masked data."""
