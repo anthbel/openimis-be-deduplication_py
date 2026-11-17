@@ -239,6 +239,7 @@ class RefusalMessagesTest(openIMISGraphQLTestCase):
             "deduplication.resolve.keep_contradicts_merge",
             "deduplication.resolve.retired_subject_enrolled",
             "deduplication.resolve.pair_already_merged",
+            "deduplication.resolve.pair_changed",
             "deduplication.resolve.decision_missing",
         }
         self.assertEqual(set(REFUSAL_MESSAGES), codes)

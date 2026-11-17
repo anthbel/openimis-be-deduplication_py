@@ -523,6 +523,9 @@ REFUSAL_MESSAGES = {
         "Remove it from its benefit plans and groups first, then merge.",
     "deduplication.resolve.pair_already_merged":
         "This pair was already merged under another detection; it can no longer be dismissed.",
+    "deduplication.resolve.pair_changed":
+        "One of the two records of this pair was merged into another record while it was decided. "
+        "Reload the pair and decide it again.",
     "deduplication.resolve.decision_missing":
         "The approver who completed the task recorded no decision for this pair.",
 }
@@ -864,6 +867,82 @@ def _confirm_open_siblings(candidate: DuplicateCandidate, *, actor, note: str):
         sibling.save()
 
 
+def _subjects_gone(subject_model: str, subject_ids) -> set:
+    """The ids among ``subject_ids`` whose subject row is soft-deleted or missing."""
+    rows = {str(row.pk): row for row in apps.get_model(subject_model)._base_manager.filter(pk__in=list(subject_ids))}
+    return {subject_id for subject_id in subject_ids
+            if subject_id not in rows or getattr(rows[subject_id], 'is_deleted', False)}
+
+
+def _other_subject(row: DuplicateCandidate, subject_id: str) -> str:
+    return row.subject_b if row.subject_a == subject_id else row.subject_a
+
+
+def _with_move(evidence, move: dict) -> dict:
+    """``evidence`` with ``move`` appended to its ``moved_from`` list."""
+    evidence = dict(evidence or {})
+    evidence['moved_from'] = list(evidence.get('moved_from') or []) + [move]
+    return evidence
+
+
+def _move_open_pairs(candidate: DuplicateCandidate, kept, retired, *, actor):
+    """
+    After a merge of retired into kept, moves each other OPEN candidate (retired, other) onto kept, so that no
+    OPEN pair names a subject the merge deleted:
+
+    - other deleted or missing: left as it is, both its subjects being gone;
+    - no (kept, other) candidate of its kind: it becomes (kept, other), its evidence naming the merge under
+      ``moved_from``;
+    - an OPEN (kept, other) of its kind: that candidate names it under ``moved_from`` and it is deleted;
+    - a DISMISSED (kept, other) of its kind: it is DISMISSED too, kept and retired being one subject.
+
+    The candidates are locked in id order after the merged candidate.
+    """
+    kept_id, retired_id = str(kept.id), str(retired.id)
+    model = candidate.subject_model
+    stale = list(DuplicateCandidate.objects.filter(subject_model=model, status=DuplicateCandidate.Status.OPEN)
+                 .filter(Q(subject_a=retired_id) | Q(subject_b=retired_id))
+                 .exclude(subject_a=candidate.subject_a, subject_b=candidate.subject_b))
+    if not stale:
+        return
+    targets = Q(pk__in=[])
+    for row in stale:
+        low, high = order_pair(kept_id, _other_subject(row, retired_id))
+        targets |= Q(subject_a=low, subject_b=high, kind=row.kind)
+    target_ids = list(DuplicateCandidate.objects.filter(subject_model=model).filter(targets)
+                      .values_list('pk', flat=True))
+    locked = {row.pk: row for row in DuplicateCandidate.objects.select_for_update()
+              .filter(pk__in=[row.pk for row in stale] + target_ids).order_by('pk')}
+    moving = [locked[row.pk] for row in stale if row.pk in locked
+              and locked[row.pk].status == DuplicateCandidate.Status.OPEN
+              and retired_id in (locked[row.pk].subject_a, locked[row.pk].subject_b)]
+    gone = _subjects_gone(model, {_other_subject(row, retired_id) for row in moving})
+    by_pair = {(row.subject_a, row.subject_b, row.kind): row for row in locked.values()}
+    now = datetime.now()
+    move = {'subject': retired_id, 'kept': kept_id, 'merged_by': str(candidate.pk), 'at': now.isoformat()}
+    for row in moving:
+        other = _other_subject(row, retired_id)
+        if other in gone:
+            continue
+        low, high = order_pair(kept_id, other)
+        target = by_pair.get((low, high, row.kind))
+        if target is None:
+            row.subject_a, row.subject_b = low, high
+            row.evidence = _with_move(row.evidence, move)
+            row.save()
+        elif target.status == DuplicateCandidate.Status.OPEN:
+            target.evidence = _with_move(target.evidence, {**move, 'candidate_id': str(row.pk), 'score': row.score})
+            target.save()
+            row.delete()
+        elif target.status == DuplicateCandidate.Status.DISMISSED:
+            row.status = DuplicateCandidate.Status.DISMISSED
+            row.reviewed_by = actor.username
+            row.reviewed_at = now
+            row.decision_note = (f"{retired_id} was merged into {kept_id} (candidate {candidate.pk}), which was "
+                                 f"judged different from {other} (candidate {target.pk}).")
+            row.save()
+
+
 def _refused_by_preparer(refusal: MergeRefusal) -> ResolveRefusal:
     return ResolveRefusal(refusal.code, refusal.details, message=refusal.message)
 
@@ -990,13 +1069,20 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
     with deduplication.resolve.keep_contradicts_merge. A "different" on a candidate whose
     pair already has a CONFIRMED sibling is refused with
     deduplication.resolve.pair_already_merged, leaving the candidate OPEN.
+
+    A merge then moves the other OPEN candidates naming the retired subject onto the kept
+    subject (_move_open_pairs). A candidate moved or deleted that way after the caller read
+    it is refused with deduplication.resolve.pair_changed, its subjects being locked as read.
     """
     _validate_decision(decision)
 
     with transaction.atomic():
         locked = _lock_for_preparers(candidate, keep) if decision == 'same' else []
-        _lock_subjects(candidate.subject_model, (candidate.subject_a, candidate.subject_b))
-        candidate = DuplicateCandidate.objects.select_for_update().get(pk=candidate.pk)
+        pair = (candidate.subject_a, candidate.subject_b)
+        _lock_subjects(candidate.subject_model, pair)
+        candidate = DuplicateCandidate.objects.select_for_update().filter(pk=candidate.pk).first()
+        if candidate is None or (candidate.subject_a, candidate.subject_b) != pair:
+            raise ResolveRefusal("deduplication.resolve.pair_changed")
         if candidate.status != DuplicateCandidate.Status.OPEN:
             return candidate
         plan = plan_resolve(candidate, decision=decision, keep=keep)
@@ -1013,6 +1099,8 @@ def resolve(candidate: DuplicateCandidate, *, decision: str, keep: Optional[str]
         candidate.save()
         if candidate.status == DuplicateCandidate.Status.CONFIRMED:
             _confirm_open_siblings(candidate, actor=actor, note=note)
+        if plan.merge:
+            _move_open_pairs(candidate, plan.kept, plan.retired, actor=actor)
     return candidate
 
 

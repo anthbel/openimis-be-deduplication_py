@@ -375,6 +375,27 @@ refused with `deduplication.resolve.keep_contradicts_merge`. A `different` on a 
 pair already has a `CONFIRMED` sibling is refused with `deduplication.resolve.pair_already_merged`;
 the candidate stays `OPEN`.
 
+A merge leaves no `OPEN` pair naming the subject it deleted. In the merge transaction, after the merged
+candidate and its siblings, every other `OPEN` candidate `(retired, other)` of the subject model is locked
+with the `(kept, other)` candidates of the same kinds, in id order, and:
+
+- `other` deleted or missing: left as it is; it names two deleted subjects and holds neither;
+- no `(kept, other)` candidate of its kind: it becomes `(kept, other)` (ordered by `order_pair`), keeps
+  its kind, score, evidence, status `OPEN` and review task, and its evidence gains
+  `moved_from: [{"subject": <retired>, "kept": <kept>, "merged_by": <merged candidate id>, "at": <time>}]`;
+- an `OPEN` `(kept, other)` of its kind: that candidate's evidence gains the same entry with
+  `"candidate_id"` and `"score"` of the stale candidate, which is deleted; its own score and columns stay;
+- a `DISMISSED` `(kept, other)` of its kind: the stale candidate is `DISMISSED` as well, `reviewed_by` the
+  merging user, its note naming both candidates: kept and retired are one subject, judged different from
+  `other`.
+
+A `(kept, other)` candidate cannot be `CONFIRMED` while `other` is live, `kept` being live. The evidence of a
+moved candidate compares `retired` with `other`. A `resolve` given a candidate that a merge moved or deleted
+after the caller read it is refused with `deduplication.resolve.pair_changed`: its subject locks were taken on
+the pair as read. A review task of a moved candidate keeps naming `retired` in its `data`; completing it with
+`keep` = `retired` is refused with `keep_not_in_pair`, and the task can be failed and created again. A review
+task of a deleted stale candidate completes without a decision, as for any candidate that no longer exists.
+
 **Merge preparers.** Another module prepares a merge with `deduplication.sources.register_merge_preparer(key,
 preparer)` (`None` removes it). A preparer has two phases, run in key order:
 
@@ -454,7 +475,8 @@ Every refusal of `resolve` is a `ResolveRefusal` (a `ValueError`) carrying its c
 as `{"message": <readable English text>, "code": <code>, "detail": <code and details>}`. The
 openIMIS journal prints `[code] message` and shows `detail` when expanded; it translates
 neither, and no backend module ships compiled message catalogues, so the message is English.
-Screens that read the mutation log themselves translate the `code`.
+Screens that read the mutation log themselves translate the `code`. `deduplication.resolve.pair_changed`
+refuses a candidate that a merge moved or deleted after the caller read it (§4.3).
 
 ### 4.5 Tests
 registry and `order_pair`; demographic source on fixture individuals (json_ext column);
