@@ -74,6 +74,15 @@ class MergeDuplicateBeneficiariesEnrolmentTest(TestCase):
         task.save(username=self.user.username)
         result = TaskService(self.user).complete_task({"id": str(task.id)})
         self.assertTrue(result["success"], result)
+        return Task.objects.get(id=task.id)
+
+    def assertFailedWith(self, task, reason):
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertIn(reason, task.json_ext["completion_error"])
+
+    def assertCompleted(self, task):
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertNotIn("completion_error", task.json_ext or {})
 
     def _created_review_task(self):
         result = CreateDeduplicationReviewTasksService(self.user).create_beneficiary_duplication_tasks(
@@ -172,6 +181,35 @@ class MergeDuplicateBeneficiariesEnrolmentTest(TestCase):
         self.assertFalse(self.other.is_deleted)
         self.assertEqual(self.oldest.status, BeneficiaryStatus.SUSPENDED)
 
+    def test_a_merge_written_completes_its_task(self):
+        task = self._complete_review_task({"status": BeneficiaryStatus.ACTIVE}, self._created_review_task())
+
+        self.assertCompleted(task)
+        self._refresh()
+        self.assertTrue(self.other.is_deleted)
+
+    def test_a_merge_the_hooks_refuse_fails_its_task_with_the_reason(self):
+        self._hook(refuse=True)
+        task = self._complete_review_task({"status": BeneficiaryStatus.ACTIVE, "k1": "v2"})
+
+        self.assertFailedWith(task, "refused by the hook")
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.POTENTIAL)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_a_merge_refused_on_a_stale_kept_row_fails_its_task_and_keeps_the_rows(self):
+        task = self._created_review_task()
+        self.oldest.status = BeneficiaryStatus.SUSPENDED
+        self.oldest.save(username=self.user.username)
+        task = self._complete_review_task({"status": BeneficiaryStatus.ACTIVE, "k1": "v2"}, task)
+
+        self.assertFailedWith(task, "changed since the review task was created")
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.SUSPENDED)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
 
 @skipUnless(apps.is_installed("programme_targeting"), "programme_targeting registers the enrolment rules")
 class MergeUnderTheEnrolmentRulesTest(TestCase):
@@ -206,6 +244,7 @@ class MergeUnderTheEnrolmentRulesTest(TestCase):
         self.assertTrue(TaskService(self.user).complete_task({"id": str(task.id)})["success"])
         kept.refresh_from_db()
         other.refresh_from_db()
+        return Task.objects.get(id=task.id)
 
     def test_a_merge_that_would_raise_the_plan_over_its_cap_is_refused(self):
         plan = self._plan("DDRCAP", 1)
@@ -218,6 +257,18 @@ class MergeUnderTheEnrolmentRulesTest(TestCase):
         self.assertFalse(other.is_deleted)
         self.assertEqual(Beneficiary.objects.filter(
             benefit_plan=plan, is_deleted=False, status=BeneficiaryStatus.ACTIVE).count(), 1)
+
+    def test_a_merge_refused_over_the_cap_fails_its_task_with_the_reason(self):
+        plan = self._plan("DDRCAPF", 1)
+        self._beneficiary(plan, "Active", BeneficiaryStatus.ACTIVE)
+        kept = self._beneficiary(plan, "Kept", BeneficiaryStatus.POTENTIAL, {"k": "v"})
+        other = self._beneficiary(plan, "Other", BeneficiaryStatus.POTENTIAL)
+        task = self._merge(kept, other, {"status": BeneficiaryStatus.ACTIVE, "k": "w"})
+
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertIn("Benefit plan is already at max active beneficiaries", task.json_ext["completion_error"])
+        self.assertEqual((kept.status, kept.json_ext), (BeneficiaryStatus.POTENTIAL, {"k": "v"}))
+        self.assertFalse(other.is_deleted)
 
     def test_activating_a_selection_suspended_row_removes_the_suspension_key(self):
         from programme_targeting.enrolment_rules import SUSPENSION_KEY

@@ -38,7 +38,7 @@ from social_protection.models import Beneficiary, BenefitPlan
 from social_protection.services import BeneficiaryService
 from tasks_management.apps import TasksManagementConfig
 from tasks_management.models import Task
-from tasks_management.services import TaskService
+from tasks_management.services import TaskService, _fail_completed_task
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,9 @@ class CreateDeduplicationReviewTasksService:
             tasks = []
 
             for task_data in summary:
+                # A row naming a beneficiary out of the user's locations is left out, as the summary leaves it out.
+                if _beneficiaries_out_of_scope(task_data.get('ids') or [], self.user):
+                    continue
                 self.validation_class.validate_create_deduplication_task(task_data, self.get_class_name())
                 task_data = {**task_data, MERGE_STATE_KEY: _beneficiaries_state(task_data['ids'])}
                 create_task_data = {
@@ -434,13 +437,19 @@ def _update_merged_beneficiary(beneficiary, beneficiary_kwargs, json_ext_kwargs,
         raise ValidationError(f"{result.get('message')}: {result.get('detail')}")
 
 
-def _require_beneficiaries_in_scope(beneficiary_ids, user):
-    """Raises ValidationError unless ``user`` may see every one of the beneficiaries (``Beneficiary.get_queryset``)."""
+def _beneficiaries_out_of_scope(beneficiary_ids, user):
+    """The ids, sorted, of the existing beneficiaries among ``beneficiary_ids`` that ``user`` may not see
+    (``Beneficiary.get_queryset``)."""
     rows = Beneficiary.objects.filter(id__in=beneficiary_ids)
     visible = set(Beneficiary.get_queryset(rows, user).values_list('id', flat=True))
-    out_of_scope = [str(row_id) for row_id in rows.values_list('id', flat=True) if row_id not in visible]
+    return sorted(str(row_id) for row_id in rows.values_list('id', flat=True) if row_id not in visible)
+
+
+def _require_beneficiaries_in_scope(beneficiary_ids, user):
+    """Raises ValidationError unless ``user`` may see every one of the beneficiaries (``Beneficiary.get_queryset``)."""
+    out_of_scope = _beneficiaries_out_of_scope(beneficiary_ids, user)
     if out_of_scope:
-        raise ValidationError(f"Beneficiaries out of the user's locations: {', '.join(sorted(out_of_scope))}")
+        raise ValidationError(f"Beneficiaries out of the user's locations: {', '.join(out_of_scope)}")
 
 
 def _require_unchanged_since_task(beneficiary, task_state):
@@ -504,7 +513,22 @@ def merge_duplicate_beneficiaries(task_data, user_id):
         _update_merged_beneficiary(oldest_record_beneficiary, beneficiary_kwargs, json_kwargs, user)
 
 
+def _merge_refusal(task, user):
+    """Merges the beneficiaries of the completed review ``task``: the reason the merge was refused or failed, with
+    nothing written, or None once it is written."""
+    try:
+        merge_duplicate_beneficiaries(task, user.id)
+    except ValidationError as exc:
+        return "; ".join(exc.messages)
+    except Exception as exc:
+        logger.error("Error while merging the beneficiaries of review task %s", task.get('id'), exc_info=exc)
+        return str(exc) or exc.__class__.__name__
+    return None
+
+
 def on_deduplication_task_complete_service_handler(**kwargs):
+    """After complete_task, merges the beneficiaries of a completed beneficiary review task. A refused or failed
+    merge sets the task FAILED with the reason under ``completion_error`` of its json_ext."""
     try:
         result = kwargs.get('result', {})
         task = result['data']['task']
@@ -512,7 +536,11 @@ def on_deduplication_task_complete_service_handler(**kwargs):
         user_id = result['data']['user']["id"]
         if (result and result['success'] and task['status'] == Task.Status.COMPLETED
                 and source == CreateDeduplicationReviewTasksService.get_class_name()):
-            merge_duplicate_beneficiaries(task, user_id)
+            user = User.objects.get(id=user_id)
+            refusal = _merge_refusal(task, user)
+            if refusal:
+                _fail_completed_task(task['id'], user, refusal)
+                return [refusal]
     except Exception as e:
         logger.error("Error while executing on_task_complete", exc_info=e)
         return [str(e)]

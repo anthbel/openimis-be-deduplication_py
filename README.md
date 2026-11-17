@@ -23,7 +23,8 @@ reader without 900101: each beneficiary or benefit row, its person, and the summ
 
 A summary row is given only when the user may see every beneficiary (`Beneficiary.get_queryset`)
 or every benefit's person (`Individual.get_queryset`) of its `ids`; a row with one record out of
-the user's locations is left out.
+the user's locations is left out. `createDeduplicationTasks` applies the same rule to the rows it is given:
+a row naming a beneficiary the user may not see gets no review task, and the other rows get theirs.
 
 A beneficiary review task records in `data.current_state` the `status` and `version` of each of
 its beneficiaries when it is created.
@@ -36,8 +37,9 @@ through `BeneficiaryService.update`, sending each only when the merge changes it
 nothing when the completing user may not see one of the beneficiaries (`Beneficiary.get_queryset`),
 when the kept beneficiary no longer has the `status` and `version` its task recorded (a write since
 the task was created, such as a suspension, calls for a new review; a task without `current_state`
-is not checked), or when a hook refuses the write. A refused merge rolls back whole; the task stays
-`COMPLETED` and the refusal is logged.
+is not checked), or when a hook refuses the write. A refused or failed merge rolls back whole and the task
+ends `FAILED` instead of `COMPLETED`, with the reason under `completion_error` of its `json_ext` (as
+`tasks_management` does for a refused approval).
 
 ## Candidate sources
 
