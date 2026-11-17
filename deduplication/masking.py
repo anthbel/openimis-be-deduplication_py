@@ -89,3 +89,18 @@ def mask_review_task_data(model, serialized_data):
     if isinstance(column_values, dict):
         mask_summary_values(model, column_values, person="individual")
     return serialized_data
+
+
+def summary_review_task_masker(model):
+    """A task masker for the review tasks made from a duplication summary row of ``model`` rows (beneficiaries
+    or benefits): the stored row's ``column_values`` masked as the summaries mask them. Registered with
+    individual's task mask, which applies it for a reader without the masked-data right."""
+
+    def mask(task):
+        data = getattr(task, "data", None)
+        column_values = data.get("column_values") if isinstance(data, dict) else None
+        if isinstance(column_values, dict):
+            mask_summary_values(model, column_values, person="individual")
+        return task
+
+    return mask

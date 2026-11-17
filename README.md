@@ -78,8 +78,12 @@ names no model. Other evidence keys are given as stored.
 A review task (source `deduplication_candidate`) holds a copy of its candidate's evidence in its
 `data`. The module registers a masker for that source with `individual`'s task mask
 (`TaskMask.register_source`), so the task's `data` and `businessData` give the evidence masked
-the same way to a user without the masked-data right, on the task queries and through
-`duplicateCandidates { task }`.
+the same way to a user without the masked-data right, on the task queries, the task history and
+through `duplicateCandidates { task }`. The beneficiary and payment review tasks
+(`CreateDeduplicationReviewTasksService`, `CreateDeduplicationPaymentReviewTasksService`) store the
+summary row they were made from in `data.column_values`; maskers registered for those sources mask
+each value whose column reads a masked field, by the rule of the summaries, on the task, its node
+and its history.
 
 Services (`deduplication/services.py`):
 
