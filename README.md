@@ -17,6 +17,13 @@ A column reading the beneficiary's or benefit's own `json_ext` (a bare key, `jso
 or `json_ext`) is also checked against the person's `json_ext`, which it may copy.
 Grouping and counts are computed on the stored values.
 
+A summary column is `first_name`, `last_name` or `dob` (the person's), one of the beneficiary's (or, for
+`benefitDeduplicationSummary`, the person's) own columns or a key of one of its JSON columns
+(`json_ext__<key>`), for `beneficiaryDeduplicationSummary` one of the beneficiary's person's own columns or
+JSON keys (`individual__<column>`, `individual__json_ext__<key>`), or a bare `json_ext` key; a column
+following any other relation is refused before any query, naming the column
+(`the summary column <column> is not allowed`), whoever the user.
+
 The `businessData` of the beneficiary and payment review tasks is masked the same way for a
 reader without 900101: each beneficiary or benefit row, its person, and the summary row
 (`column_values`) the task was made from.
