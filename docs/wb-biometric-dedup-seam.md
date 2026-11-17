@@ -399,7 +399,8 @@ A `(kept, other)` candidate cannot be `CONFIRMED` while `other` is live, `kept` 
 moved candidate compares `retired` with `other`. A `resolve` given a candidate that a merge moved or deleted
 after the caller read it is refused with `deduplication.resolve.pair_changed`: its subject locks were taken on
 the pair as read. A review task of a moved candidate keeps naming `retired` in its `data`; completing it with
-`keep` = `retired` is refused with `keep_not_in_pair`, and the task can be failed and created again. A review
+`keep` = `retired` is refused with `keep_not_in_pair`, and completing it with `keep` = `other` merges `kept`
+into `other`; the task can also be failed and created again. A review
 task of a deleted stale candidate completes without a decision, as for any candidate that no longer exists.
 
 **Merge preparers.** Another module prepares a merge with `deduplication.sources.register_merge_preparer(key,
