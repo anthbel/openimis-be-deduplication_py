@@ -21,11 +21,13 @@ from core.signals import register_service_signal
 from core.utils import to_json_safe_value
 from deduplication.apps import DeduplicationConfig
 from deduplication.column_resolution import resolve_columns, is_model_column
+from deduplication.masking import mask_review_task_data
 from deduplication.models import DuplicateCandidate, ScanState
 from deduplication.sources import Candidate, Watermark, order_pair, sources as registered_sources, \
     without_left_out
 from deduplication.validations import CreateDeduplicationReviewTasksValidation, \
     CreateDeduplicationPaymentReviewTasksValidation
+from individual.data_masking import may_see_masked
 from individual.models import Individual
 from invoice.models import Bill, BillItem
 from payroll.models import BenefitConsumption, BenefitConsumptionStatus, \
@@ -37,6 +39,11 @@ from tasks_management.models import Task
 from tasks_management.services import TaskService
 
 logger = logging.getLogger(__name__)
+
+
+def _may_see_masked(user):
+    """Whether ``user``, the reader of a review task's business data, may see masked data; no user may not."""
+    return user is not None and not getattr(user, "is_anonymous", True) and may_see_masked(user)
 
 
 class CreateDeduplicationReviewTasksService:
@@ -138,6 +145,8 @@ class CreateDeduplicationReviewTasksService:
             serialized_data[key] = serializer(key, value)
 
         serialized_data['headers'] = get_headers(benefit_plan)
+        if not _may_see_masked(self.user):
+            mask_review_task_data(Beneficiary, serialized_data)
 
         return serialized_data
 
@@ -263,6 +272,8 @@ class CreateDeduplicationPaymentReviewTasksService:
         for key, value in data.items():
             serialized_data[key] = serializer(key, value)
         serialized_data['headers'] = get_headers()
+        if not _may_see_masked(self.user):
+            mask_review_task_data(BenefitConsumption, serialized_data)
         return serialized_data
 
     @classmethod

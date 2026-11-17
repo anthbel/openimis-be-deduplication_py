@@ -6,17 +6,20 @@ import copy
 from django.apps import apps
 
 from core.data_masking import DataMaskAbs, MaskingClassStorage
-from individual.data_masking import MASK_PLACEHOLDER, reads_masked_field
+from individual.data_masking import MASK_PLACEHOLDER, IndividualMask, reads_masked_field
 
-JSON_LOOKUP = "json_ext__"
+JSON_EXT = "json_ext"
+JSON_LOOKUP = JSON_EXT + "__"
 
 
 def reads_masked_column(model, column, person=None):
     """Whether ``column`` of ``model`` reads a field a registered mask masks. ``person`` names the relation to
-    the person whose json_ext keys ``model``'s own json_ext may copy, so its keys are also checked there."""
+    the person whose json_ext keys ``model``'s own json_ext may copy: a column reading ``model``'s json_ext
+    (``json_ext``, ``json_ext__<key>`` or a bare key) is also checked on the person's json_ext."""
     lookups = [column, JSON_LOOKUP + column]
     if person:
-        lookups.append(f"{person}__{JSON_LOOKUP}{column}")
+        lookups += [f"{person}__{lookup}" for lookup in lookups
+                    if lookup == JSON_EXT or lookup.startswith(JSON_LOOKUP)]
     return any(reads_masked_field(model, lookup) for lookup in lookups)
 
 
@@ -45,3 +48,35 @@ def mask_summary_values(model, column_values, person):
         if reads_masked_column(model, column, person=person):
             column_values[column] = MASK_PLACEHOLDER
     return column_values
+
+
+def mask_representation(model, values, person=None):
+    """Replaces in place, by the value individual's masks give, each value of ``values`` (a
+    ``model_representation`` of a ``model`` row) whose field reads a masked field; a ``json_ext`` dict is
+    masked key by key. ``person`` as in ``reads_masked_column``."""
+    mask = IndividualMask()
+    for key, value in values.items():
+        if key == JSON_EXT and isinstance(value, dict):
+            for json_key in value:
+                if reads_masked_column(model, JSON_LOOKUP + json_key, person=person):
+                    value[json_key] = mask.anonymize(value[json_key])
+        elif reads_masked_column(model, key, person=person):
+            values[key] = mask.anonymize(value)
+    return values
+
+
+def mask_review_task_data(model, serialized_data):
+    """Masks in place the business data of a duplicate review task of ``model`` rows (beneficiaries or
+    benefits): each row of ``ids`` with its person, and the summary row ``column_values`` it was made from."""
+    from individual.models import Individual
+
+    for row in serialized_data.get("ids") or []:
+        if not isinstance(row, dict):
+            continue
+        if isinstance(row.get("individual"), dict):
+            mask_representation(Individual, row["individual"])
+        mask_representation(model, row, person="individual")
+    column_values = serialized_data.get("column_values")
+    if isinstance(column_values, dict):
+        mask_summary_values(model, column_values, person="individual")
+    return serialized_data
