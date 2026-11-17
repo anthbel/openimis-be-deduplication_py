@@ -414,7 +414,10 @@ refusal's `deduplication.resolve.<reason>` code and English message when `resolv
 would refuse the decision, and true (`code` and `message` null) otherwise, including for a candidate
 that is no longer `OPEN`. It needs `gql_query_duplicates_perms`, like the candidate queries; a
 caller without it gets the `Unauthorized` GraphQL error and no result. An unknown `decision` or a
-missing candidate is a GraphQL error. Mutations `runDuplicateScan(kinds)`,
+missing candidate is a GraphQL error. The candidate queries, the `node` lookup and a task's
+`duplicateCandidates` give a pair only when both subjects are within the user's locations
+(`DuplicateCandidate.get_queryset`, which applies the subject model's own `get_queryset`); for
+`duplicateCandidateResolveCheck` a pair out of scope is a missing candidate. Mutations `runDuplicateScan(kinds)`,
 `resolveDuplicateCandidate(id, decision, keep, note)`, `createDuplicateReviewTasks(ids)`.
 Rights: `gql_resolve_duplicate_perms=["172003"]`, `gql_run_scan_perms=["172004"]`,
 `gql_query_duplicates_perms=["172005"]` via module configuration; review-task creation keeps

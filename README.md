@@ -21,6 +21,17 @@ The `businessData` of the beneficiary and payment review tasks is masked the sam
 reader without 900101: each beneficiary or benefit row, its person, and the summary row
 (`column_values`) the task was made from.
 
+A summary row is given only when the user may see every beneficiary (`Beneficiary.get_queryset`)
+or every benefit's person (`Individual.get_queryset`) of its `ids`; a row with one record out of
+the user's locations is left out.
+
+`merge_duplicate_beneficiaries` (completion of a beneficiary review task) runs between the
+enrolment hooks of the beneficiaries' benefit plans (`social_protection.enrolment_hooks.enrolment_write`):
+it deletes the other beneficiaries, then writes the merged `status` and `json_ext` of the oldest one
+through `BeneficiaryService.update`, sending each only when the merge changes it, so the hooks'
+`before_service_write` checks and adjusts that write as for the service's other callers. A refusal
+of a hook rolls the whole merge back; the task stays `COMPLETED` and the refusal is logged.
+
 ## Candidate sources
 
 `deduplication.sources` is the seam other modules (e.g. `biometric_verification`) use to
@@ -148,7 +159,13 @@ Loaded the same way as the legacy rights, via `ModuleConfiguration` onto
 ## GraphQL
 
 - `duplicateCandidates(status, kind, subjectId, first, offset, orderBy)` — paginated
-  connection over `DuplicateCandidate` (`gql_query_duplicates_perms`).
+  connection over `DuplicateCandidate` (`gql_query_duplicates_perms`). With `ROW_SECURITY`, a
+  user who is not an IMIS admin gets only the pairs whose two subjects are both rows the subject
+  model's `get_queryset(None, user)` gives the user (`DuplicateCandidate.get_queryset`):
+  for `individual.Individual`, the person's location or its household's; for `individual.Group`,
+  the group's location; a soft-deleted subject included. A pair with one subject out of the
+  user's locations is left out. The same scope applies to the `node` lookup of a candidate, to
+  `duplicateCandidates` of a task, and to `duplicateCandidateResolveCheck`.
 - `runDuplicateScan(kinds)` — mutation, runs `run_scan` (`gql_run_scan_perms`).
 - `resolveDuplicateCandidate(id, decision, keep, note)` — mutation, runs `resolve`
   (`gql_resolve_duplicate_perms`); fails with `deduplication.mutation.candidate_not_open`

@@ -1,7 +1,10 @@
 import uuid
 
+from django.apps import apps
+from django.conf import settings
 from django.db import models
-from django.db.models import F, Q
+from django.db.models import CharField, F, Q
+from django.db.models.functions import Cast, Lower
 from django.utils.translation import gettext_lazy as _
 
 
@@ -50,6 +53,40 @@ class DuplicateCandidate(models.Model):
 
     def __str__(self):
         return f"{self.subject_model} {self.subject_a}/{self.subject_b} ({self.kind})"
+
+    @classmethod
+    def get_queryset(cls, queryset, user):
+        """``queryset`` (every candidate when None) narrowed to the pairs whose two subjects are both rows the
+        subject model's own ``get_queryset(None, user)`` gives ``user`` (``Individual``: the person's or its
+        household's location; ``Group``: the group's location). A pair with a subject out of reach, or whose
+        subject model has no such method, is left out."""
+        if queryset is None:
+            queryset = cls.objects.all()
+        if not settings.ROW_SECURITY:
+            return queryset
+        if user.is_anonymous:
+            return queryset.none()
+        if user.is_imis_admin:
+            return queryset
+        in_scope = Q(pk__in=[])
+        for label in queryset.order_by().values_list("subject_model", flat=True).distinct():
+            subject_ids = _visible_subject_ids(label, user)
+            if subject_ids is not None:
+                in_scope |= Q(subject_model=label, subject_a__in=subject_ids, subject_b__in=subject_ids)
+        return queryset.filter(in_scope)
+
+
+def _visible_subject_ids(subject_model, user):
+    """Subquery of the ids, as the lowercase text the candidates store, of the ``subject_model`` rows ``user``
+    may see; None when the label names no model with a ``get_queryset(queryset, user)``."""
+    try:
+        model = apps.get_model(subject_model)
+    except (LookupError, ValueError):
+        return None
+    if not callable(getattr(model, "get_queryset", None)):
+        return None
+    return (model.get_queryset(None, user).order_by()
+            .annotate(_subject_id=Lower(Cast("id", CharField()))).values("_subject_id"))
 
 
 class ScanState(models.Model):
