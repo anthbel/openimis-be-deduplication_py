@@ -4,6 +4,7 @@ from django.db.models import Q
 
 from core.schema import OrderedDjangoFilterConnectionField
 from deduplication.apps import DeduplicationConfig
+from deduplication.column_resolution import check_summary_columns
 from deduplication.gql_mutations import (
     CreateDeduplicationReviewMutation,
     CreateDeduplicationPaymentReviewMutation,
@@ -99,6 +100,7 @@ class Query(graphene.ObjectType):
             return ["deduplication.validation.no_columns_provided"]
 
         individual_columns = ['first_name', 'last_name', 'dob']
+        check_summary_columns(Beneficiary, columns, individual_columns, person='individual')
         columns = [f'individual__{column}' if column in individual_columns else column for column in columns]
         aggr = get_beneficiary_duplication_aggregation(columns=columns, benefit_plan_id=benefit_plan_id)
         aggr = _rows_in_scope(aggr, lambda ids: Beneficiary.get_queryset(
@@ -135,6 +137,7 @@ class Query(graphene.ObjectType):
 
         # Add prefix to individual columns
         individual_columns = ['first_name', 'last_name', 'dob']
+        check_summary_columns(Individual, columns, individual_columns)
         columns = [f'{column}' if column in individual_columns else column for column in columns]
 
         # Fetch the aggregation data
