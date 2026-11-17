@@ -1,3 +1,6 @@
+from unittest import skipUnless
+
+from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
@@ -61,17 +64,23 @@ class MergeDuplicateBeneficiariesEnrolmentTest(TestCase):
         self.addCleanup(enrolment_hooks.unregister_enrolment_hook, hook)
         return hook
 
-    def _complete_review_task(self, values):
-        task = Task(
-            source=CreateDeduplicationReviewTasksService.get_class_name(), executor_action_event="x",
-            business_event="", data={"ids": [str(self.oldest.id), str(self.other.id)]},
-            status=Task.Status.ACCEPTED,
-            json_ext={"additional_resolve_data": {str(self.user.id): {
-                "values": values, "beneficiaryIds": [str(self.oldest.id), str(self.other.id)]}}},
-        )
+    def _complete_review_task(self, values, task=None):
+        ids = [str(self.oldest.id), str(self.other.id)]
+        if task is None:
+            task = Task(source=CreateDeduplicationReviewTasksService.get_class_name(), executor_action_event="x",
+                        business_event="", data={"ids": ids})
+        task.status = Task.Status.ACCEPTED
+        task.json_ext = {"additional_resolve_data": {str(self.user.id): {"values": values, "beneficiaryIds": ids}}}
         task.save(username=self.user.username)
         result = TaskService(self.user).complete_task({"id": str(task.id)})
         self.assertTrue(result["success"], result)
+
+    def _created_review_task(self):
+        result = CreateDeduplicationReviewTasksService(self.user).create_beneficiary_duplication_tasks(
+            [{"ids": [str(self.oldest.id), str(self.other.id)], "count": 2,
+              "column_values": {"individual__last_name": "Dup"}}])
+        self.assertTrue(result["success"], result)
+        return Task.objects.get(id=result["data"][0]["data"]["id"])
 
     def _refresh(self):
         self.oldest.refresh_from_db()
@@ -142,3 +151,82 @@ class MergeDuplicateBeneficiariesEnrolmentTest(TestCase):
         self.assertEqual([call for call in hook.calls if call[0] == "service"], [])
         self._refresh()
         self.assertEqual(self.oldest.json_ext, {"k1": "v1", "flag": False, "n": 0})
+
+    def test_a_task_records_the_state_of_its_beneficiaries_and_merges_when_it_holds(self):
+        task = self._created_review_task()
+        self.assertEqual(task.data["current_state"][str(self.oldest.id)],
+                         {"status": BeneficiaryStatus.POTENTIAL, "version": self.oldest.version})
+        self._complete_review_task({"status": BeneficiaryStatus.ACTIVE}, task)
+
+        self._refresh()
+        self.assertTrue(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.ACTIVE)
+
+    def test_a_kept_beneficiary_written_since_the_task_was_created_is_not_merged(self):
+        task = self._created_review_task()
+        self.oldest.status = BeneficiaryStatus.SUSPENDED
+        self.oldest.save(username=self.user.username)
+        self._complete_review_task({"status": BeneficiaryStatus.ACTIVE}, task)
+
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.SUSPENDED)
+
+
+@skipUnless(apps.is_installed("programme_targeting"), "programme_targeting registers the enrolment rules")
+class MergeUnderTheEnrolmentRulesTest(TestCase):
+    """The merge under programme_targeting's enrolment rules, registered at startup."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = LogInHelper().get_or_create_user_api()
+
+    def _plan(self, code, cap):
+        plan = BenefitPlan(code=code, name=code, type=BenefitPlan.BenefitPlanType.INDIVIDUAL_TYPE,
+                           beneficiary_data_schema={}, max_beneficiaries=cap)
+        plan.save(username=self.user.username)
+        return plan
+
+    def _beneficiary(self, plan, name, status, json_ext=None):
+        person = Individual(first_name=name, last_name="Rules", dob="1990-01-01")
+        person.save(username=self.user.username)
+        beneficiary = Beneficiary(individual=person, benefit_plan=plan, status=status, json_ext=json_ext or {})
+        beneficiary.save(username=self.user.username)
+        return beneficiary
+
+    def _merge(self, kept, other, values):
+        ids = [str(kept.id), str(other.id)]
+        result = CreateDeduplicationReviewTasksService(self.user).create_beneficiary_duplication_tasks(
+            [{"ids": ids, "count": 2, "column_values": {"individual__last_name": "Rules"}}])
+        self.assertTrue(result["success"], result)
+        task = Task.objects.get(id=result["data"][0]["data"]["id"])
+        task.status = Task.Status.ACCEPTED
+        task.json_ext = {"additional_resolve_data": {str(self.user.id): {"values": values, "beneficiaryIds": ids}}}
+        task.save(username=self.user.username)
+        self.assertTrue(TaskService(self.user).complete_task({"id": str(task.id)})["success"])
+        kept.refresh_from_db()
+        other.refresh_from_db()
+
+    def test_a_merge_that_would_raise_the_plan_over_its_cap_is_refused(self):
+        plan = self._plan("DDRCAP", 1)
+        self._beneficiary(plan, "Active", BeneficiaryStatus.ACTIVE)
+        kept = self._beneficiary(plan, "Kept", BeneficiaryStatus.POTENTIAL)
+        other = self._beneficiary(plan, "Other", BeneficiaryStatus.POTENTIAL)
+        self._merge(kept, other, {"status": BeneficiaryStatus.ACTIVE})
+
+        self.assertEqual(kept.status, BeneficiaryStatus.POTENTIAL)
+        self.assertFalse(other.is_deleted)
+        self.assertEqual(Beneficiary.objects.filter(
+            benefit_plan=plan, is_deleted=False, status=BeneficiaryStatus.ACTIVE).count(), 1)
+
+    def test_activating_a_selection_suspended_row_removes_the_suspension_key(self):
+        from programme_targeting.enrolment_rules import SUSPENSION_KEY
+
+        plan = self._plan("DDRKEY", None)
+        kept = self._beneficiary(plan, "Kept", BeneficiaryStatus.SUSPENDED, {SUSPENSION_KEY: "request-1", "k": "v"})
+        other = self._beneficiary(plan, "Other", BeneficiaryStatus.POTENTIAL)
+        self._merge(kept, other, {"status": BeneficiaryStatus.ACTIVE})
+
+        self.assertEqual(kept.status, BeneficiaryStatus.ACTIVE)
+        self.assertEqual(kept.json_ext, {"k": "v"})
+        self.assertTrue(other.is_deleted)

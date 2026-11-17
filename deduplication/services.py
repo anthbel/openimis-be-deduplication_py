@@ -43,6 +43,19 @@ from tasks_management.services import TaskService
 logger = logging.getLogger(__name__)
 
 
+# Key of a beneficiary review task's data holding, per beneficiary id, the status and version the row had when
+# the task was created.
+MERGE_STATE_KEY = "current_state"
+
+
+def _beneficiaries_state(beneficiary_ids):
+    return {
+        str(row_id): {"status": status, "version": version}
+        for row_id, status, version in Beneficiary.objects.filter(id__in=beneficiary_ids).values_list(
+            "id", "status", "version")
+    }
+
+
 def _may_see_masked(user):
     """Whether ``user``, the reader of a review task's business data, may see masked data; no user may not."""
     return user is not None and not getattr(user, "is_anonymous", True) and may_see_masked(user)
@@ -60,6 +73,7 @@ class CreateDeduplicationReviewTasksService:
 
             for task_data in summary:
                 self.validation_class.validate_create_deduplication_task(task_data, self.get_class_name())
+                task_data = {**task_data, MERGE_STATE_KEY: _beneficiaries_state(task_data['ids'])}
                 create_task_data = {
                     'source': self.get_class_name(),
                     'executor_action_event': TasksManagementConfig.default_executor_event,
@@ -420,11 +434,35 @@ def _update_merged_beneficiary(beneficiary, beneficiary_kwargs, json_ext_kwargs,
         raise ValidationError(f"{result.get('message')}: {result.get('detail')}")
 
 
+def _require_beneficiaries_in_scope(beneficiary_ids, user):
+    """Raises ValidationError unless ``user`` may see every one of the beneficiaries (``Beneficiary.get_queryset``)."""
+    rows = Beneficiary.objects.filter(id__in=beneficiary_ids)
+    visible = set(Beneficiary.get_queryset(rows, user).values_list('id', flat=True))
+    out_of_scope = [str(row_id) for row_id in rows.values_list('id', flat=True) if row_id not in visible]
+    if out_of_scope:
+        raise ValidationError(f"Beneficiaries out of the user's locations: {', '.join(sorted(out_of_scope))}")
+
+
+def _require_unchanged_since_task(beneficiary, task_state):
+    """Raises ValidationError when the kept ``beneficiary``, read now, no longer has the status and version the
+    task recorded for it (``MERGE_STATE_KEY``): a write since then, a suspension among others, needs a new
+    review. A task without a recorded state is not checked."""
+    recorded = (task_state or {}).get(str(beneficiary.id))
+    if not recorded:
+        return
+    status, version = Beneficiary.objects.filter(id=beneficiary.id).values_list('status', 'version').get()
+    if status != recorded.get('status') or version != recorded.get('version'):
+        raise ValidationError(
+            f"Beneficiary {beneficiary.id} changed since the review task was created "
+            f"(status {recorded.get('status')} -> {status})")
+
+
 @transaction.atomic
 def merge_duplicate_beneficiaries(task_data, user_id):
     """Merges the beneficiaries of a completed review task into the oldest one, between the enrolment hooks of
     their benefit plans (``enrolment_hooks.enrolment_write``): the other rows are deleted first, then the merged
-    values are written. A refusal of the hooks rolls the whole merge back and raises ValidationError."""
+    values are written. It is refused (ValidationError, nothing written) when the user may not see one of the
+    beneficiaries, when the kept one changed since the task was created, or when a hook refuses it."""
     individual_fields = {"first_name", "last_name", "dob"}
     beneficiary_fields = {"status"}
 
@@ -451,8 +489,10 @@ def merge_duplicate_beneficiaries(task_data, user_id):
         else:
             json_kwargs[key] = value
 
+    _require_beneficiaries_in_scope(beneficiary_ids, user)
     plan_ids = Beneficiary.objects.filter(id__in=beneficiary_ids).values_list('benefit_plan_id', flat=True)
     with enrolment_write(Beneficiary, list(plan_ids)):
+        _require_unchanged_since_task(oldest_record_beneficiary, (task_data.get('data') or {}).get(MERGE_STATE_KEY))
         _update_instance_if_different_value(oldest_record_beneficiary.individual, individual_kwargs, user)
 
         # needs to be done this way because overridden .delete() does not work on qs
@@ -544,6 +584,8 @@ REFUSAL_MESSAGES = {
         "This pair was already merged under another detection; it can no longer be dismissed.",
     "deduplication.resolve.decision_missing":
         "The approver who completed the task recorded no decision for this pair.",
+    "deduplication.resolve.candidate_out_of_scope":
+        "One of the two records of this pair is outside the approver's locations.",
 }
 
 
@@ -964,7 +1006,7 @@ def create_review_tasks(candidate_ids, actor) -> dict:
         task_service = TaskService(actor)
         tasks = []
         eligible = (
-            DuplicateCandidate.objects
+            DuplicateCandidate.get_queryset(None, actor)
             .filter(id__in=candidate_ids, status=DuplicateCandidate.Status.OPEN)
             .exclude(task__status__in=OPEN_TASK_STATUSES)
         )
@@ -1015,6 +1057,9 @@ def resolve_candidate_of_completing_task(sender, instance, **kwargs):
         return
 
     try:
+        if not DuplicateCandidate.get_queryset(
+                DuplicateCandidate.objects.filter(id=candidate.id), instance.user_updated).exists():
+            raise ResolveRefusal("deduplication.resolve.candidate_out_of_scope")
         additional_resolve_data = (instance.json_ext or {}).get('additional_resolve_data') or {}
         resolve_data = additional_resolve_data.get(str(instance.user_updated_id))
         if not isinstance(resolve_data, dict) or not resolve_data.get('decision'):

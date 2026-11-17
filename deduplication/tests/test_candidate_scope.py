@@ -5,9 +5,11 @@ import graphene
 from django.core.cache import caches
 from django.test import override_settings
 
+from core.models import MutationLog
 from core.models.openimis_graphql_test_case import openIMISGraphQLTestCase, BaseTestContext
 from core.test_helpers import create_right_only_user
 from deduplication.models import DuplicateCandidate
+from deduplication.services import CreateDeduplicationReviewTasksService, create_review_tasks
 from deduplication.sources import order_pair
 from deduplication.tests.helpers import LogInHelper
 from individual.models import Group, GroupIndividual, Individual
@@ -15,8 +17,10 @@ from location.models import Location
 from payroll.models import BenefitConsumption
 from social_protection.models import Beneficiary, BeneficiaryStatus, BenefitPlan
 from tasks_management.models import Task, TaskExecutor, TaskGroup
+from tasks_management.services import TaskService
 
-RIGHTS = ["gql_query_duplicates_perms", "gql_beneficiary_search_perms"]
+RIGHTS = ["gql_query_duplicates_perms", "gql_beneficiary_search_perms", "gql_resolve_duplicate_perms",
+          "gql_create_deduplication_review_perms"]
 
 CANDIDATES_QUERY = """
 query { duplicateCandidates(first: 50) { totalCount edges { node { id } } } }
@@ -35,6 +39,16 @@ query Check($id: UUID!) { duplicateCandidateResolveCheck(candidateId: $id, decis
 BENEFICIARY_SUMMARY_QUERY = """
 query Summary($plan: UUID!) {
   beneficiaryDeduplicationSummary(columns: ["first_name"], benefitPlanId: $plan) { rows { count ids } }
+}
+"""
+RESOLVE_MUTATION = """
+mutation Resolve($input: ResolveDuplicateCandidateMutationInput!) {
+  resolveDuplicateCandidate(input: $input) { clientMutationId }
+}
+"""
+CREATE_TASKS_MUTATION = """
+mutation Tasks($input: CreateDuplicateReviewTasksMutationInput!) {
+  createDuplicateReviewTasks(input: $input) { clientMutationId }
 }
 """
 BENEFIT_SUMMARY_QUERY = """
@@ -75,9 +89,14 @@ class DuplicateCandidateScopeTest(openIMISGraphQLTestCase):
         near, near_too, far, far_too = (self._person(n, loc) for n, loc in (
             ("Near", self.village), ("NearToo", self.village), ("Far", self.other_village),
             ("FarToo", self.other_village)))
+        # Lives outside the user's districts, in a household inside them: the membership moves the person to the
+        # household's location, so the person's own location is set afterwards.
         housed = self._person("Housed", None)
         GroupIndividual(group=self._group("DDS-G1", self.village), individual=housed,
                         role=GroupIndividual.Role.HEAD).save(user=self.admin)
+        Individual.objects.filter(id=housed.id).update(location=self.other_village)
+        housed.refresh_from_db()
+        self.assertEqual(housed.location_id, self.other_village.id)
         retired = self._person("Retired", self.village)
         retired.delete(user=self.admin)
         group, group_too, far_group = (self._group(code, loc) for code, loc in (
@@ -203,3 +222,71 @@ class DuplicateCandidateScopeTest(openIMISGraphQLTestCase):
             admin_rows = self._run(BENEFIT_SUMMARY_QUERY, self.admin_token)["benefitDeduplicationSummary"]["rows"]
         self.assertEqual([set(row["ids"]) for row in rows], [{str(benefit_id) for benefit_id in benefits[:2]}])
         self.assertEqual(len(admin_rows), 2)
+
+    def _mutate(self, query, mutation_input, client_mutation_id):
+        self._run(query, self.user_token, {"input": {**mutation_input, "clientMutationId": client_mutation_id}})
+        return MutationLog.objects.get(client_mutation_id=client_mutation_id)
+
+    def test_resolve_mutation_finds_no_pair_out_of_scope(self):
+        for number, candidate_id in enumerate(sorted(self.hidden)):
+            log = self._mutate(RESOLVE_MUTATION, {"id": candidate_id, "decision": "different"}, f"dds-out-{number}")
+            self.assertEqual(log.status, MutationLog.ERROR, log.error)
+            self.assertIn("does not exist", log.error)
+            self.assertEqual(DuplicateCandidate.objects.get(id=candidate_id).status, DuplicateCandidate.Status.OPEN)
+        log = self._mutate(RESOLVE_MUTATION, {"id": self.in_scope, "decision": "different"}, "dds-in")
+        self.assertEqual(log.status, MutationLog.SUCCESS, log.error)
+        self.assertEqual(DuplicateCandidate.objects.get(id=self.in_scope).status, DuplicateCandidate.Status.DISMISSED)
+
+    def test_review_tasks_are_created_only_for_pairs_in_scope(self):
+        log = self._mutate(CREATE_TASKS_MUTATION, {"ids": [self.in_scope, self.cross, self.out_of_scope]}, "dds-tasks")
+        self.assertEqual(log.status, MutationLog.SUCCESS, log.error)
+        tasks = dict(DuplicateCandidate.objects.filter(
+            id__in=[self.in_scope, self.cross, self.out_of_scope]).values_list("id", "task_id"))
+        self.assertIsNotNone(tasks[self._uuid(self.in_scope)])
+        self.assertIsNone(tasks[self._uuid(self.cross)])
+        self.assertIsNone(tasks[self._uuid(self.out_of_scope)])
+
+    @staticmethod
+    def _uuid(candidate_id):
+        return DuplicateCandidate.objects.get(id=candidate_id).id
+
+    def test_an_approver_out_of_the_pairs_scope_cannot_resolve_it_by_completing_its_task(self):
+        create_review_tasks([self.cross, self.in_scope], self.admin)
+        service = TaskService(self.user)
+
+        def complete(candidate_id):
+            task_id = DuplicateCandidate.objects.get(id=candidate_id).task_id
+            service.resolve_task({"id": task_id, "business_status": {}, "additional_data": {"decision": "different"}})
+            return service.complete_task({"id": task_id})
+
+        refused = complete(self.cross)
+        self.assertFalse(refused["success"], refused)
+        self.assertIn("deduplication.resolve.candidate_out_of_scope", str(refused))
+        self.assertEqual(DuplicateCandidate.objects.get(id=self.cross).status, DuplicateCandidate.Status.OPEN)
+        accepted = complete(self.in_scope)
+        self.assertTrue(accepted["success"], accepted)
+        self.assertEqual(DuplicateCandidate.objects.get(id=self.in_scope).status, DuplicateCandidate.Status.DISMISSED)
+
+    def test_a_beneficiary_merge_with_a_row_out_of_scope_deletes_nothing(self):
+        plan = BenefitPlan(code="DDS-M", name="DDS-M", type=BenefitPlan.BenefitPlanType.INDIVIDUAL_TYPE,
+                           beneficiary_data_schema={})
+        plan.save(user=self.admin)
+        rows = []
+        for person in self._summary_people([("Twin", self.village), ("Twin", self.other_village)]):
+            row = Beneficiary(individual=person, benefit_plan=plan, status=BeneficiaryStatus.POTENTIAL)
+            row.save(user=self.admin)
+            rows.append(row)
+        ids = [str(row.id) for row in rows]
+        result = CreateDeduplicationReviewTasksService(self.admin).create_beneficiary_duplication_tasks(
+            [{"ids": ids, "count": 2, "column_values": {"individual__first_name": "Twin"}}])
+        self.assertTrue(result["success"], result)
+        task = Task.objects.get(id=result["data"][0]["data"]["id"])
+        task.status = Task.Status.ACCEPTED
+        task.json_ext = {"additional_resolve_data": {str(self.user.id): {"values": {}, "beneficiaryIds": ids}}}
+        task.save(user=self.admin)
+
+        TaskService(self.user).complete_task({"id": str(task.id)})
+
+        for row in rows:
+            row.refresh_from_db()
+            self.assertFalse(row.is_deleted)

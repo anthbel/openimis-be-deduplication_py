@@ -167,7 +167,7 @@ class ResolveDuplicateCandidateMutation(OpenIMISMutation):
             cls._validate(user, **data)
             data.pop('client_mutation_id', None)
             data.pop('client_mutation_label', None)
-            candidate = DuplicateCandidate.objects.get(id=data['id'])
+            candidate = DuplicateCandidate.get_queryset(None, user).get(id=data['id'])
             if candidate.status != DuplicateCandidate.Status.OPEN:
                 raise ValidationError("deduplication.mutation.candidate_not_open")
             resolve(

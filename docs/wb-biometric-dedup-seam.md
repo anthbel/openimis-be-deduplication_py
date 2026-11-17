@@ -379,7 +379,7 @@ the sibling-confirmed pass-through, which plans no merge), and the enrolment gua
 longer `OPEN` needs no decision and is never refused. An unknown `decision` raises `ValueError`.
 
 Review through Tasks Management stays available: `create_review_tasks(candidate_ids, actor)`
-creates one `tasks_management.Task` per candidate (`source="deduplication_candidate"`, `data` =
+creates one `tasks_management.Task` per candidate `actor` may see (`source="deduplication_candidate"`, `data` =
 candidate summary, `task` FK set). A `pre_save` receiver on `tasks_management.Task` bridges the
 completion: when a `deduplication_candidate` task moves to `COMPLETED` and its candidate is
 `OPEN`, it calls `resolve()` with the decision of the approver whose action completes the task,
@@ -425,7 +425,8 @@ Rights: `gql_resolve_duplicate_perms=["172003"]`, `gql_run_scan_perms=["172004"]
 
 Every refusal of `resolve` is a `ResolveRefusal` (a `ValueError`) carrying its code:
 `deduplication.resolve.keep_not_in_pair`, `subject_deleted`, `keep_contradicts_merge`,
-`retired_subject_enrolled`, `pair_already_merged` and `decision_missing` (task bridge only);
+`retired_subject_enrolled`, `pair_already_merged`, and `decision_missing` and `candidate_out_of_scope`
+(task bridge only: the completing approver may not see one of the pair's subjects);
 `str()` starts with the code. `resolveDuplicateCandidate` records a refusal in the mutation log
 as `{"message": <readable English text>, "code": <code>, "detail": <code and details>}`. The
 openIMIS journal prints `[code] message` and shows `detail` when expanded; it translates
