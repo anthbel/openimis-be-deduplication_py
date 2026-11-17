@@ -9,11 +9,13 @@ from core.models import MutationLog
 from core.models.openimis_graphql_test_case import openIMISGraphQLTestCase, BaseTestContext
 from core.test_helpers import create_right_only_user
 from deduplication.models import DuplicateCandidate
-from deduplication.services import CreateDeduplicationReviewTasksService, create_review_tasks
+from deduplication.services import CreateDeduplicationPaymentReviewTasksService, \
+    CreateDeduplicationReviewTasksService, create_review_tasks
 from deduplication.sources import order_pair
 from deduplication.tests.helpers import LogInHelper
 from individual.models import Group, GroupIndividual, Individual
 from location.models import Location
+from payment_cycle.models import PaymentCycle
 from payroll.models import BenefitConsumption
 from social_protection.models import Beneficiary, BeneficiaryStatus, BenefitPlan
 from tasks_management.models import Task, TaskExecutor, TaskGroup
@@ -336,3 +338,72 @@ class DuplicateCandidateScopeTest(openIMISGraphQLTestCase):
         for row in rows:
             row.refresh_from_db()
             self.assertFalse(row.is_deleted)
+
+    def _benefits(self, names_and_locations):
+        benefits = []
+        for person in self._summary_people(names_and_locations):
+            benefit = BenefitConsumption(individual=person, code="DDS-PB")
+            benefit.save(user=self.admin)
+            benefits.append(str(benefit.id))
+        return benefits
+
+    def _payment_cycle(self):
+        cycle = PaymentCycle(code="DDS-PC", start_date="2026-01-01", end_date="2026-01-31")
+        cycle.save(user=self.admin)
+        return cycle
+
+    def test_payment_review_tasks_are_created_only_for_rows_in_scope(self):
+        benefits = self._benefits([("Twin", self.village), ("Twin", self.village),
+                                   ("Split", self.village), ("Split", self.other_village)])
+        summary = [
+            {"count": 2, "ids": benefits[:2], "column_values": {"individual__first_name": "Twin"}},
+            {"count": 2, "ids": benefits[2:], "column_values": {"individual__first_name": "Split"}},
+        ]
+        result = CreateDeduplicationPaymentReviewTasksService(self.user).create_payment_benefit_duplication_tasks(
+            summary, str(self._payment_cycle().id))
+
+        self.assertTrue(result["success"], result)
+        tasks = Task.objects.filter(source=CreateDeduplicationPaymentReviewTasksService.get_class_name())
+        self.assertEqual([sorted(task.data["ids"]) for task in tasks], [sorted(benefits[:2])])
+        flagged = {str(benefit.id) for benefit in BenefitConsumption.objects.filter(
+            id__in=benefits, json_ext__duplicated="duplicated")}
+        self.assertEqual(flagged, set(benefits[:2]))
+
+    def _completed_payment_task(self, benefits):
+        result = CreateDeduplicationPaymentReviewTasksService(self.admin).create_payment_benefit_duplication_tasks(
+            [{"count": 2, "ids": benefits, "column_values": {"individual__first_name": "Twin"}}],
+            str(self._payment_cycle().id))
+        self.assertTrue(result["success"], result)
+        task = Task.objects.get(id=result["data"][0]["data"]["id"])
+        task.status = Task.Status.ACCEPTED
+        task.json_ext = {"additional_resolve_data": {str(self.user.id): {"benefitIds": benefits}}}
+        task.save(user=self.admin)
+        TaskService(self.user).complete_task({"id": str(task.id)})
+        task.refresh_from_db()
+        return task
+
+    def test_a_payment_removal_out_of_scope_fails_its_task_and_removes_nothing(self):
+        benefits = self._benefits([("Twin", self.village), ("Twin", self.other_village)])
+        task = self._completed_payment_task(benefits)
+
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertIn(f"out of the user's locations: {benefits[1]}", task.json_ext["completion_error"])
+        self.assertEqual(BenefitConsumption.objects.filter(id__in=benefits, is_deleted=False).count(), 2)
+
+    def test_a_failed_payment_removal_fails_its_task_and_removes_nothing(self):
+        benefits = self._benefits([("Twin", self.village), ("Twin", self.village)])
+        with mock.patch("deduplication.services.PayrollBenefitConsumption.objects.filter",
+                        side_effect=RuntimeError("payroll locked")):
+            task = self._completed_payment_task(benefits)
+
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertIn("payroll locked", task.json_ext["completion_error"])
+        self.assertEqual(BenefitConsumption.objects.filter(id__in=benefits, is_deleted=False).count(), 2)
+
+    def test_a_payment_removal_in_scope_completes_its_task(self):
+        benefits = self._benefits([("Twin", self.village), ("Twin", self.village)])
+        task = self._completed_payment_task(benefits)
+
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertNotIn("completion_error", task.json_ext)
+        self.assertFalse(BenefitConsumption.objects.filter(id__in=benefits, is_deleted=False).exists())
