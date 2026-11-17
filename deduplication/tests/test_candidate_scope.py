@@ -51,6 +51,11 @@ mutation Tasks($input: CreateDuplicateReviewTasksMutationInput!) {
   createDuplicateReviewTasks(input: $input) { clientMutationId }
 }
 """
+SUMMARY_TASKS_MUTATION = """
+mutation SummaryTasks($input: CreateDeduplicationReviewMutationInput!) {
+  createDeduplicationTasks(input: $input) { clientMutationId }
+}
+"""
 BENEFIT_SUMMARY_QUERY = """
 query { benefitDeduplicationSummary(columns: ["first_name"], paymentCycleId: "1") { rows { count ids } } }
 """
@@ -245,6 +250,47 @@ class DuplicateCandidateScopeTest(openIMISGraphQLTestCase):
         self.assertIsNotNone(tasks[self._uuid(self.in_scope)])
         self.assertIsNone(tasks[self._uuid(self.cross)])
         self.assertIsNone(tasks[self._uuid(self.out_of_scope)])
+
+    def _plan_rows(self, code, names_and_locations):
+        plan = BenefitPlan(code=code, name=code, type=BenefitPlan.BenefitPlanType.INDIVIDUAL_TYPE,
+                           beneficiary_data_schema={})
+        plan.save(user=self.admin)
+        rows = []
+        for person in self._summary_people(names_and_locations):
+            row = Beneficiary(individual=person, benefit_plan=plan, status=BeneficiaryStatus.POTENTIAL)
+            row.save(user=self.admin)
+            rows.append(str(row.id))
+        return rows
+
+    def test_summary_review_tasks_are_created_only_for_rows_in_scope(self):
+        rows = self._plan_rows("DDS-T", [("Twin", self.village), ("Twin", self.village),
+                                         ("Split", self.village), ("Split", self.other_village)])
+        summary = [
+            {"count": 2, "ids": rows[:2], "columnValues": json.dumps({"individual__first_name": "Twin"})},
+            {"count": 2, "ids": rows[2:], "columnValues": json.dumps({"individual__first_name": "Split"})},
+        ]
+        log = self._mutate(SUMMARY_TASKS_MUTATION, {"summary": summary}, "dds-summary-tasks")
+
+        self.assertEqual(log.status, MutationLog.SUCCESS, log.error)
+        tasks = Task.objects.filter(source=CreateDeduplicationReviewTasksService.get_class_name())
+        self.assertEqual([sorted(task.data["ids"]) for task in tasks], [sorted(rows[:2])])
+
+    def test_a_beneficiary_merge_refused_out_of_scope_fails_its_task_with_the_reason(self):
+        ids = self._plan_rows("DDS-F", [("Twin", self.village), ("Twin", self.other_village)])
+        result = CreateDeduplicationReviewTasksService(self.admin).create_beneficiary_duplication_tasks(
+            [{"ids": ids, "count": 2, "column_values": {"individual__first_name": "Twin"}}])
+        self.assertTrue(result["success"], result)
+        task = Task.objects.get(id=result["data"][0]["data"]["id"])
+        task.status = Task.Status.ACCEPTED
+        task.json_ext = {"additional_resolve_data": {str(self.user.id): {"values": {}, "beneficiaryIds": ids}}}
+        task.save(user=self.admin)
+
+        TaskService(self.user).complete_task({"id": str(task.id)})
+
+        task.refresh_from_db()
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertIn("out of the user's locations", task.json_ext["completion_error"])
+        self.assertEqual(Beneficiary.objects.filter(id__in=ids, is_deleted=False).count(), 2)
 
     @staticmethod
     def _uuid(candidate_id):
