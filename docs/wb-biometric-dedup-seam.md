@@ -55,6 +55,8 @@ class CandidateSource(abc.ABC):
     def scan(self, since: Watermark | None) -> Iterable[Candidate]: ...
     @abc.abstractmethod
     def watermark(self) -> Watermark: ...      # where the next scan starts
+    def covered(self, subject_model: str, subject_ids, state) -> set: ...
+        # the ids, as passed, its last scan covered; default: (date_updated, id) at or before the cursor
 
 def register(source: CandidateSource) -> None
 def sources() -> list[CandidateSource]        # registration order

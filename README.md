@@ -31,7 +31,11 @@ direction:
 - `Candidate(subject_model, subject_a, subject_b, kind, score, evidence)` — one suspected
   duplicate pair; `subject_a < subject_b` as strings, `kind` identifies the detector
   (`"demographic"`, `"identifier"`, `"biometric"`, or any other registered kind).
-- `CandidateSource` — ABC with `scan(since)` and `watermark()`.
+- `CandidateSource` — ABC with `scan(since)` and `watermark()`, and `covered(subject_model, subject_ids,
+  state)`, which returns the ids among `subject_ids`, as passed, that the source's last scan covered,
+  `state` being its `ScanState` row. The default is the rule of the subject sources: a subject is covered
+  when its `(date_updated, id)` is at or before the cursor; an empty cursor covers nobody. A source whose
+  cursor is not a subject's (`biometric`) overrides it.
 - `register(source)` / `sources()` — a process-wide registry, in registration order.
 - `order_pair(a, b)` — sorts two subject ids into the canonical `(a, b)` order.
 - `register_subject_filter(key, subject_filter)` — registers

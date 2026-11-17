@@ -41,6 +41,14 @@ class CandidateSource(abc.ABC):
         """Cursor where the next scan should start from."""
         raise NotImplementedError
 
+    def covered(self, subject_model: str, subject_ids: Iterable, state) -> Set:
+        """The ids among ``subject_ids``, as passed, that this source's last scan covered; ``state`` is the
+        source's ScanState row. The default is the rule of subject sources: a subject is covered when its
+        ``(date_updated, id)`` is at or before the cursor, and an empty cursor covers nobody."""
+        from deduplication.sources.subject import subject_covered
+
+        return subject_covered(subject_model, subject_ids, state)
+
 
 _REGISTRY: List[CandidateSource] = []
 
