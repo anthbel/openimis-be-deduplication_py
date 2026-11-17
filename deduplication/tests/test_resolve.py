@@ -330,3 +330,154 @@ class ResolveLocksSubjectsTest(WithoutMergePreparers, TestCase):
             resolve(candidate, decision="different", actor=self.user)
 
         self._assert_subjects_locked_first_in_order(low, high, ctx.captured_queries)
+
+
+class ResolveMovesOpenPairsOfTheRetiredSubjectTest(TestCase):
+    """A merge of (kept, retired) moves the other OPEN candidates naming retired onto kept."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.user = LogInHelper().get_or_create_user_api()
+
+    def _person(self, name):
+        person = Individual(first_name=name, last_name="Moved", dob="1990-01-01")
+        person.save(username=self.user.username)
+        return person
+
+    def _candidate(self, first, second, kind="demographic", **fields):
+        subject_a, subject_b = order_pair(str(first.id), str(second.id))
+        return DuplicateCandidate.objects.create(
+            subject_model="individual.Individual", subject_a=subject_a, subject_b=subject_b,
+            kind=kind, source="TestSource", **{"evidence": {}, **fields},
+        )
+
+    def setUp(self):
+        self.kept, self.retired, self.other = self._person("Kept"), self._person("Retired"), self._person("Other")
+        self.merged = self._candidate(self.kept, self.retired)
+
+    def _merge(self):
+        resolve(self.merged, decision="same", keep=str(self.kept.id), actor=self.user)
+
+    def test_an_open_pair_on_the_retired_subject_moves_to_the_kept_subject(self):
+        stale = self._candidate(self.retired, self.other, score=0.9, evidence={"columns": {"last_name": "Moved"}})
+
+        self._merge()
+
+        stale.refresh_from_db()
+        self.assertEqual((stale.subject_a, stale.subject_b), order_pair(str(self.kept.id), str(self.other.id)))
+        self.assertEqual((stale.status, stale.kind, stale.score), (DuplicateCandidate.Status.OPEN, "demographic", 0.9))
+        self.assertEqual(stale.evidence["columns"], {"last_name": "Moved"})
+        self.assertEqual(len(stale.evidence["moved_from"]), 1)
+        move = stale.evidence["moved_from"][0]
+        self.assertEqual((move["subject"], move["kept"], move["merged_by"]),
+                         (str(self.retired.id), str(self.kept.id), str(self.merged.id)))
+
+    def test_the_moved_pair_can_be_merged(self):
+        stale = self._candidate(self.retired, self.other)
+        self._merge()
+        stale.refresh_from_db()
+
+        resolve(stale, decision="same", keep=str(self.kept.id), actor=self.user)
+
+        stale.refresh_from_db()
+        self.other.refresh_from_db()
+        self.assertEqual(stale.status, DuplicateCandidate.Status.CONFIRMED)
+        self.assertTrue(self.other.is_deleted)
+
+    def test_a_pair_already_open_on_the_kept_subject_takes_the_move_and_the_stale_pair_is_deleted(self):
+        stale = self._candidate(self.retired, self.other, score=0.7)
+        existing = self._candidate(self.kept, self.other, score=0.8, evidence={"columns": {"dob": "1990-01-01"}})
+
+        self._merge()
+
+        self.assertFalse(DuplicateCandidate.objects.filter(id=stale.id).exists())
+        existing.refresh_from_db()
+        self.assertEqual((existing.status, existing.score), (DuplicateCandidate.Status.OPEN, 0.8))
+        self.assertEqual(existing.evidence["columns"], {"dob": "1990-01-01"})
+        move = existing.evidence["moved_from"][0]
+        self.assertEqual((move["candidate_id"], move["score"], move["subject"]),
+                         (str(stale.id), 0.7, str(self.retired.id)))
+
+    def test_a_pair_dismissed_on_the_kept_subject_dismisses_the_stale_pair(self):
+        stale = self._candidate(self.retired, self.other)
+        dismissed = self._candidate(self.kept, self.other, status=DuplicateCandidate.Status.DISMISSED)
+
+        self._merge()
+
+        stale.refresh_from_db()
+        self.assertEqual(stale.status, DuplicateCandidate.Status.DISMISSED)
+        self.assertEqual(stale.reviewed_by, self.user.username)
+        self.assertIsNotNone(stale.reviewed_at)
+        self.assertIn(str(dismissed.id), stale.decision_note)
+        self.assertEqual((stale.subject_a, stale.subject_b), order_pair(str(self.retired.id), str(self.other.id)))
+
+    def test_only_a_candidate_of_the_same_kind_takes_the_move(self):
+        stale = self._candidate(self.retired, self.other, kind="biometric_face")
+        other_kind = self._candidate(self.kept, self.other, status=DuplicateCandidate.Status.DISMISSED)
+
+        self._merge()
+
+        stale.refresh_from_db()
+        self.assertEqual((stale.subject_a, stale.subject_b), order_pair(str(self.kept.id), str(self.other.id)))
+        self.assertEqual(stale.status, DuplicateCandidate.Status.OPEN)
+        other_kind.refresh_from_db()
+        self.assertEqual(other_kind.status, DuplicateCandidate.Status.DISMISSED)
+
+    def test_a_pair_whose_other_subject_is_deleted_is_left_as_it_is(self):
+        stale = self._candidate(self.retired, self.other)
+        self.other.delete(user=self.user)
+
+        self._merge()
+
+        stale.refresh_from_db()
+        self.assertEqual((stale.subject_a, stale.subject_b), order_pair(str(self.retired.id), str(self.other.id)))
+        self.assertEqual(stale.status, DuplicateCandidate.Status.OPEN)
+        self.assertNotIn("moved_from", stale.evidence)
+
+    def test_a_dismissal_moves_nothing(self):
+        stale = self._candidate(self.retired, self.other)
+
+        resolve(self.merged, decision="different", actor=self.user)
+
+        stale.refresh_from_db()
+        self.assertEqual((stale.subject_a, stale.subject_b), order_pair(str(self.retired.id), str(self.other.id)))
+
+    def test_a_candidate_moved_after_it_was_read_is_refused(self):
+        stale = self._candidate(self.retired, self.other)
+        read = DuplicateCandidate.objects.get(id=stale.id)
+        self._merge()
+
+        with self.assertRaisesMessage(ValueError, "deduplication.resolve.pair_changed"):
+            resolve(read, decision="same", keep=str(self.other.id), actor=self.user)
+
+        stale.refresh_from_db()
+        self.kept.refresh_from_db()
+        self.assertEqual(stale.status, DuplicateCandidate.Status.OPEN)
+        self.assertFalse(self.kept.is_deleted)
+
+    def test_a_candidate_deleted_by_the_move_after_it_was_read_is_refused(self):
+        stale = self._candidate(self.retired, self.other)
+        self._candidate(self.kept, self.other)
+        read = DuplicateCandidate.objects.get(id=stale.id)
+        self._merge()
+
+        with self.assertRaisesMessage(ValueError, "deduplication.resolve.pair_changed"):
+            resolve(read, decision="different", actor=self.user)
+
+    def test_the_merged_candidate_its_pair_and_the_moved_candidates_are_locked_in_one_statement_in_id_order(self):
+        sibling = self._candidate(self.kept, self.retired, kind="identifier")
+        stale = self._candidate(self.retired, self.other)
+        target = self._candidate(self.kept, self.other)
+        table = DuplicateCandidate._meta.db_table
+
+        with CaptureQueriesContext(connection) as ctx:
+            self._merge()
+
+        locks = [query["sql"] for query in ctx.captured_queries
+                 if "FOR UPDATE" in query["sql"] and f'FROM "{table}"' in query["sql"]]
+        self.assertEqual(len(locks), 1, locks)
+        self.assertIn('ORDER BY "deduplication_candidate"."id" ASC', locks[0])
+        for row in (self.merged, stale, target):
+            self.assertIn(str(row.id).replace("-", ""), locks[0].replace("-", ""))
+        self.assertIn(f"\"subject_a\" = '{sibling.subject_a}'", locks[0])

@@ -315,7 +315,11 @@ higher score and merges evidence: `evidence["columns"]` becomes the union of the
 the incoming columns, so a pair matched on several identifier keys keeps every matched key; on
 any other evidence key the incoming value wins. Both are written by an `UPDATE` filtered on
 `status = OPEN`, so a row another transaction resolved since the scan read it keeps its decision.
-Returns `(row, created)`.
+The `UPDATE` takes the row through `SELECT … FOR UPDATE SKIP LOCKED`: a row a `resolve` holds is skipped,
+so a scan never waits on a candidate row. The scan's cursor still moves past the pair, so the skipped
+rescoring is kept and written once the scan's transaction has committed (`record_deferred`, through
+`transaction.on_commit`), in a transaction of its own that holds no other lock and waits for the row; a row no
+longer `OPEN`, or whose pair a merge moved, keeps what it holds. Returns `(row, created)`.
 
 ```python
 run_scan(*, kinds: list[str] | None = None, actor: str) -> dict   # counts per kind
@@ -347,7 +351,9 @@ and error id, after the other sources' candidates are recorded.
 resolve(candidate, *, decision: "same"|"different", keep: str | None = None, actor, note="")
 ```
 `resolve` runs in one transaction that first locks both subject rows (`SELECT … FOR UPDATE`,
-one row at a time, in sorted id order), then the candidate row, before any check. Two resolves
+one row at a time, in sorted id order), then, in one statement in id order, the candidate, the other
+candidates of its pair and, for `same`, the `OPEN` candidates naming the subject to retire with the
+`(kept, other)` candidates of their kinds, before any check. Two resolves
 sharing a subject, such as (A,B) and (A,C) with opposite keeps, therefore run one after the
 other, and the second sees the first one's merge.
 
@@ -380,6 +386,27 @@ is the surviving subject and the other subject is deleted; a `keep` naming the d
 refused with `deduplication.resolve.keep_contradicts_merge`. A `different` on a candidate whose
 pair already has a `CONFIRMED` sibling is refused with `deduplication.resolve.pair_already_merged`;
 the candidate stays `OPEN`.
+
+A merge leaves no `OPEN` pair naming the subject it deleted. Each other `OPEN` candidate `(retired, other)`
+of the subject model that `resolve` locked with the candidate (above) is, in the merge transaction:
+
+- `other` deleted or missing: left as it is; it names two deleted subjects and holds neither;
+- no `(kept, other)` candidate of its kind: it becomes `(kept, other)` (ordered by `order_pair`), keeps
+  its kind, score, evidence, status `OPEN` and review task, and its evidence gains
+  `moved_from: [{"subject": <retired>, "kept": <kept>, "merged_by": <merged candidate id>, "at": <time>}]`;
+- an `OPEN` `(kept, other)` of its kind: that candidate's evidence gains the same entry with
+  `"candidate_id"` and `"score"` of the stale candidate, which is deleted; its own score and columns stay;
+- a `DISMISSED` `(kept, other)` of its kind: the stale candidate is `DISMISSED` as well, `reviewed_by` the
+  merging user, its note naming both candidates: kept and retired are one subject, judged different from
+  `other`.
+
+A `(kept, other)` candidate cannot be `CONFIRMED` while `other` is live, `kept` being live. The evidence of a
+moved candidate compares `retired` with `other`. A `resolve` given a candidate that a merge moved or deleted
+after the caller read it is refused with `deduplication.resolve.pair_changed`: its subject locks were taken on
+the pair as read. A review task of a moved candidate keeps naming `retired` in its `data`; completing it with
+`keep` = `retired` is refused with `keep_not_in_pair`, and completing it with `keep` = `other` merges `kept`
+into `other`; the task can also be failed and created again. A review
+task of a deleted stale candidate completes without a decision, as for any candidate that no longer exists.
 
 **Merge preparers.** Another module prepares a merge with `deduplication.sources.register_merge_preparer(key,
 preparer)` (`None` removes it). A preparer has two phases, run in key order:
@@ -464,7 +491,8 @@ Every refusal of `resolve` is a `ResolveRefusal` (a `ValueError`) carrying its c
 as `{"message": <readable English text>, "code": <code>, "detail": <code and details>}`. The
 openIMIS journal prints `[code] message` and shows `detail` when expanded; it translates
 neither, and no backend module ships compiled message catalogues, so the message is English.
-Screens that read the mutation log themselves translate the `code`.
+Screens that read the mutation log themselves translate the `code`. `deduplication.resolve.pair_changed`
+refuses a candidate that a merge moved or deleted after the caller read it (§4.3).
 
 ### 4.5 Tests
 registry and `order_pair`; demographic source on fixture individuals (json_ext column);
