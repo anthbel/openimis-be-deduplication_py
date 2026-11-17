@@ -493,14 +493,28 @@ def _benefits_out_of_scope(benefit_ids, user):
     return sorted(str(row_id) for row_id in rows.values_list('id', flat=True) if row_id not in visible)
 
 
-def _completing_user_resolve_data(task_data, user):
-    """The data ``user``, who completes the review task, recorded when resolving it: its entry, keyed by user id,
-    in ``additional_resolve_data`` of the task's json_ext. Raises ValidationError when there is none."""
+def _recorded_selection(task_data, ids_key, action):
+    """The selection the approvers recorded on the review task: the entries of ``additional_resolve_data`` (one per
+    approver, in the task's json_ext) whose ``ids_key`` is not empty. An approver resolving a task another approver
+    already resolved sends an empty selection. Raises ValidationError when no approver recorded one, or when
+    several recorded different ones (ids or values); the reason names no value."""
     additional_resolve_data = (task_data.get("json_ext") or {}).get("additional_resolve_data") or {}
-    resolve_data = additional_resolve_data.get(str(user.id))
-    if not isinstance(resolve_data, dict):
-        raise ValidationError("The user who completed the review task recorded no merge")
-    return resolve_data
+    recorded = [entry for entry in additional_resolve_data.values() if isinstance(entry, dict) and entry.get(ids_key)]
+    if not recorded:
+        raise ValidationError(f"The approvers of the review task recorded no {action}")
+    selections = {json.dumps({**entry, ids_key: sorted(str(entry_id) for entry_id in entry[ids_key])},
+                             sort_keys=True, default=str) for entry in recorded}
+    if len(selections) > 1:
+        raise ValidationError(f"The approvers of the review task recorded different {action}s")
+    return recorded[0]
+
+
+def _require_in_task(ids, task_data, records):
+    """Raises ValidationError when one of ``ids`` is not among the ``ids`` of the review task's data."""
+    task_ids = {str(task_id) for task_id in (task_data.get('data') or {}).get('ids') or []}
+    not_in_task = sorted({str(record_id) for record_id in ids} - task_ids)
+    if not_in_task:
+        raise ValidationError(f"{records} not in the review task: {', '.join(not_in_task)}")
 
 
 def _require_unchanged_since_task(beneficiary, task_state):
@@ -521,23 +535,20 @@ def _require_unchanged_since_task(beneficiary, task_state):
 def merge_duplicate_beneficiaries(task_data, user_id):
     """Merges the beneficiaries of a completed review task into the oldest one, between the enrolment hooks of
     their benefit plans (``enrolment_hooks.enrolment_write``): the other rows are deleted first, then the merged
-    values are written. The beneficiaries and values are those the completing user recorded
-    (``_completing_user_resolve_data``), the beneficiaries being two or more undeleted ones of the task's own
-    ``ids``. It is refused (ValidationError, nothing written) when the completing user recorded no merge, names
-    a beneficiary the task does not, or fewer than two undeleted ones; when the user may not see one of the
+    values are written. The beneficiaries and values are those the approvers recorded (``_recorded_selection``),
+    the beneficiaries being two or more undeleted ones of the task's own ``ids``. It is refused (ValidationError,
+    nothing written) when no approver recorded a merge or several recorded different ones, when it names a
+    beneficiary the task does not or fewer than two undeleted ones; when the user may not see one of the
     beneficiaries; when the kept one changed since the task was created; when the merged json_ext breaks the
     plan's ``beneficiary_data_schema``; or when a hook refuses it."""
     individual_fields = {"first_name", "last_name", "dob"}
     beneficiary_fields = {"status"}
 
     user = User.objects.get(id=user_id)
-    merge_data = _completing_user_resolve_data(task_data, user)
+    merge_data = _recorded_selection(task_data, "beneficiaryIds", "merge")
     field_values = merge_data.get('values') or {}
-    beneficiary_ids = [str(beneficiary_id) for beneficiary_id in merge_data.get("beneficiaryIds") or []]
-    task_ids = {str(beneficiary_id) for beneficiary_id in (task_data.get('data') or {}).get('ids') or []}
-    not_in_task = sorted(set(beneficiary_ids) - task_ids)
-    if not_in_task:
-        raise ValidationError(f"Beneficiaries not in the review task: {', '.join(not_in_task)}")
+    beneficiary_ids = [str(beneficiary_id) for beneficiary_id in merge_data["beneficiaryIds"]]
+    _require_in_task(beneficiary_ids, task_data, "Beneficiaries")
     # A beneficiary deleted since the task was created, by another merge among others, takes no part.
     live_beneficiaries = Beneficiary.objects.filter(id__in=beneficiary_ids, is_deleted=False)
     beneficiary_ids = [str(beneficiary_id) for beneficiary_id in live_beneficiaries.values_list('id', flat=True)]
@@ -609,12 +620,13 @@ def on_deduplication_task_complete_service_handler(**kwargs):
 @transaction.atomic
 def remove_duplicate_benefit_payments(task_data, user):
     """Removes the benefits chosen on a completed payment review task, with their attachments, bills and payroll
-    links. It is refused (ValidationError, nothing removed) when ``user``, who completes the task, may not see the
-    person of one of the benefits."""
-    # additional_resolve_data is a key in task__json_ext that stores data selected by user during resolving a task
-    additional_resolve_data = task_data.get("json_ext", {}).get("additional_resolve_data", {})
-    merge_data = list(additional_resolve_data.values())[0]
-    benefit_ids = merge_data.get("benefitIds", [])
+    links. The benefits are those the approvers recorded (``_recorded_selection``), among the task's own ``ids``.
+    It is refused (ValidationError, nothing removed) when no approver recorded a removal or several recorded
+    different ones, when it names a benefit the task does not, or when ``user``, who completes the task, may not
+    see the person of one of the benefits."""
+    selection = _recorded_selection(task_data, "benefitIds", "removal")
+    benefit_ids = [str(benefit_id) for benefit_id in selection["benefitIds"]]
+    _require_in_task(benefit_ids, task_data, "Benefits")
     out_of_scope = _benefits_out_of_scope(benefit_ids, user)
     if out_of_scope:
         raise ValidationError(f"Benefits out of the user's locations: {', '.join(out_of_scope)}")

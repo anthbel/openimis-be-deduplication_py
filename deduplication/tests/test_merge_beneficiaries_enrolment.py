@@ -255,7 +255,7 @@ class MergeDuplicateBeneficiariesEnrolmentTest(TestCase):
         task = self._complete_with_resolve_data(
             {str(self.user.id): {"values": {"k1": "v2"}, "beneficiaryIds": []}})
 
-        self.assertFailedWith(task, "fewer than two beneficiaries")
+        self.assertFailedWith(task, "recorded no merge")
         self._refresh()
         self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
 
@@ -291,26 +291,40 @@ class MergeDuplicateBeneficiariesEnrolmentTest(TestCase):
         self.assertFalse(self.other.is_deleted)
         self.assertEqual(self.other.json_ext, {"k1": "v2"})
 
-    def test_the_merge_uses_the_resolve_data_of_the_completing_user(self):
-        # jsonb orders keys of one length bytewise: this resolver comes first in additional_resolve_data.
-        earlier_resolver = "00000000-0000-0000-0000-000000000000"
+    def test_approvers_recording_different_merges_fail_the_task_without_naming_a_value(self):
         task = self._complete_with_resolve_data({
-            earlier_resolver: {"values": {"k1": "earlier"}, "beneficiaryIds": self._pair_ids()},
-            str(self.user.id): {"values": {"k1": "completing"}, "beneficiaryIds": self._pair_ids()},
+            str(uuid.uuid4()): {"values": {"k1": "first"}, "beneficiaryIds": self._pair_ids()},
+            str(self.user.id): {"values": {"k1": "second"}, "beneficiaryIds": self._pair_ids()},
+        })
+
+        self.assertFailedWith(task, "recorded different merges")
+        self.assertNotIn("first", task.json_ext["completion_error"])
+        self.assertNotIn("second", task.json_ext["completion_error"])
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_approvers_recording_the_same_merge_in_another_order_merge_it(self):
+        task = self._complete_with_resolve_data({
+            str(uuid.uuid4()): {"values": {"k1": "v2"}, "beneficiaryIds": self._pair_ids()},
+            str(self.user.id): {"values": {"k1": "v2"}, "beneficiaryIds": self._pair_ids()[::-1]},
         })
 
         self.assertCompleted(task)
         self._refresh()
-        self.assertEqual(self.oldest.json_ext, {"k1": "completing", "mark": "m"})
+        self.assertTrue(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v2", "mark": "m"})
 
-    def test_a_completing_user_without_resolve_data_fails_the_task(self):
-        task = self._complete_with_resolve_data({str(uuid.uuid4()): {
-            "values": {"k1": "earlier"}, "beneficiaryIds": self._pair_ids()}})
+    def test_the_merge_another_approver_recorded_is_used_when_the_completing_user_recorded_none(self):
+        task = self._complete_with_resolve_data({
+            str(uuid.uuid4()): {"values": {"k1": "recorded"}, "beneficiaryIds": self._pair_ids()},
+            str(self.user.id): {"values": {}, "beneficiaryIds": []},
+        })
 
-        self.assertFailedWith(task, "recorded no merge")
+        self.assertCompleted(task)
         self._refresh()
-        self.assertFalse(self.other.is_deleted)
-        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+        self.assertTrue(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "recorded", "mark": "m"})
 
     def _with_schema(self, schema):
         self.plan.beneficiary_data_schema = schema
