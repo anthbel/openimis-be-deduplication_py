@@ -232,6 +232,8 @@ class CandidateOrderingTest(MaskedFieldsMixin, openIMISGraphQLTestCase):
         for candidate, name in zip(cls.by_id, ("Zelda", "Abel")):
             candidate.evidence = {"columns": {"first_name": name}}
             candidate.save()
+        result = create_review_tasks([candidate.id for candidate in cls.by_id], admin)
+        assert result["success"] and all(task["success"] for task in result["data"]), result
 
     def _ids(self, name, order):
         response = self.query(CANDIDATE_ORDER_QUERY % order,
@@ -240,10 +242,16 @@ class CandidateOrderingTest(MaskedFieldsMixin, openIMISGraphQLTestCase):
         edges = json.loads(response.content)["data"]["duplicateCandidates"]["edges"]
         return [graphene.relay.Node.from_global_id(edge["node"]["id"])[1] for edge in edges]
 
+    ORDERS = ("evidence__columns__first_name", "evidence_Columns_FirstName",
+              "task__data__evidence__columns__first_name", "task_Data_Evidence_Columns_FirstName")
+
     def test_an_ordering_on_the_evidence_is_left_out_without_the_masked_data_right(self):
-        self.assertEqual(self._ids("duplicates", "evidence__columns__first_name"),
-                         [str(candidate.id) for candidate in self.by_id])
+        for order in self.ORDERS:
+            with self.subTest(order=order):
+                self.assertEqual(self._ids("duplicates", order), [str(candidate.id) for candidate in self.by_id])
 
     def test_an_ordering_on_the_evidence_applies_with_the_masked_data_right(self):
-        self.assertEqual(self._ids("dup_unmasked", "evidence__columns__first_name"),
-                         [str(candidate.id) for candidate in reversed(self.by_id)])
+        for order in self.ORDERS:
+            with self.subTest(order=order):
+                self.assertEqual(self._ids("dup_unmasked", order),
+                                 [str(candidate.id) for candidate in reversed(self.by_id)])

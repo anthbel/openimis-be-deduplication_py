@@ -85,8 +85,9 @@ summary row they were made from in `data.column_values`; maskers registered for 
 each value whose column reads a masked field, by the rule of the summaries, on the task, its node
 and its history.
 
-For a user without the masked-data right, an `orderBy` term of `duplicateCandidates` ordering by
-the evidence is left out (logged at info), and the primary key orders last.
+For a user without the masked-data right, an `orderBy` term of `duplicateCandidates` whose path
+traverses a JSON field (the evidence, or one reached through a relation such as the review task's
+`data`) or names no field is left out (logged at info), and the primary key orders last.
 
 Services (`deduplication/services.py`):
 
