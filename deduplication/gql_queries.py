@@ -5,7 +5,9 @@ from graphene_django import DjangoObjectType
 
 from core import ExtendedConnection
 from deduplication.apps import DeduplicationConfig
+from deduplication.masking import masked_evidence
 from deduplication.models import DuplicateCandidate
+from individual.data_masking import context_may_see_masked
 
 
 class DeduplicationSummaryRowGQLType(graphene.ObjectType):
@@ -56,3 +58,9 @@ class DuplicateCandidateGQLType(DjangoObjectType):
         if user.is_anonymous or not user.id or not user.has_perms(DeduplicationConfig.gql_query_duplicates_perms):
             raise PermissionDenied(_("unauthorized"))
         return queryset
+
+    def resolve_evidence(self, info):
+        """The evidence with the values of masked subject fields masked, unless the user may see masked data."""
+        if context_may_see_masked(info):
+            return self.evidence
+        return masked_evidence(self.subject_model, self.evidence)

@@ -9,6 +9,12 @@ through `tasks_management` tasks (`CreateDeduplicationReviewTasksService`,
 GraphQL: `beneficiaryDeduplicationSummary`, `benefitDeduplicationSummary`,
 `createDeduplicationTasks`, `createDeduplicationPaymentTasks`.
 
+For a user without the masked-data right (core `gql_query_enable_viewing_masked_data_perms`,
+900101), a summary column that reads a field a registered mask masks gives the string mask
+in `columnValues`: a column of the beneficiary or benefit, of its person (`individual`'s
+person mask, with the fields other modules register), or a `json_ext` key masked on either.
+Grouping and counts are computed on the stored values.
+
 ## Candidate sources
 
 `deduplication.sources` is the seam other modules (e.g. `biometric_verification`) use to
@@ -56,6 +62,12 @@ resolved with `django.apps.apps.get_model`).
 `status` (`OPEN` / `CONFIRMED` / `DISMISSED`), an optional `task` FK, and review metadata
 (`reviewed_by`, `reviewed_at`, `decision_note`). `ScanState` keeps one watermark row per
 source `kind`.
+
+`DuplicateCandidate.evidence` is stored as the sources give it. Read through GraphQL by a
+user without the masked-data right (900101), each value of its `columns` that reads a field
+the mask of the subject model masks (`individual`'s person or group mask, with the fields
+other modules register) is masked by that mask; every value is masked when `subject_model`
+names no model. Other evidence keys are given as stored.
 
 Services (`deduplication/services.py`):
 
