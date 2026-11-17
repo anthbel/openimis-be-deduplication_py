@@ -316,8 +316,10 @@ the incoming columns, so a pair matched on several identifier keys keeps every m
 any other evidence key the incoming value wins. Both are written by an `UPDATE` filtered on
 `status = OPEN`, so a row another transaction resolved since the scan read it keeps its decision.
 The `UPDATE` takes the row through `SELECT … FOR UPDATE SKIP LOCKED`: a row a `resolve` holds is skipped,
-so a scan never waits on a candidate row. The skipped rescoring is written by a later scan that reads the
-pair again. Returns `(row, created)`.
+so a scan never waits on a candidate row. The scan's cursor still moves past the pair, so the skipped
+rescoring is kept and written once the scan's transaction has committed (`record_deferred`, through
+`transaction.on_commit`), in a transaction of its own that holds no other lock and waits for the row; a row no
+longer `OPEN`, or whose pair a merge moved, keeps what it holds. Returns `(row, created)`.
 
 ```python
 run_scan(*, kinds: list[str] | None = None, actor: str) -> dict   # counts per kind
