@@ -39,6 +39,7 @@ Config: `BIOMETRIC["SUBJECT_MODEL"]` and `DEDUPLICATION["SUBJECT_MODEL"]`, both 
 class Watermark:
     updated_at: datetime | None = None
     last_id: str | None = None
+    snapshot: ReadSnapshot | None = None   # row versions the scan read (deduplication/sources/snapshot.py)
 
 @dataclass(frozen=True)
 class Candidate:
@@ -57,6 +58,7 @@ class CandidateSource(abc.ABC):
     def watermark(self) -> Watermark: ...      # where the next scan starts
     def covered(self, subject_model: str, subject_ids, state) -> set: ...
         # the ids, as passed, its last scan covered; default: (date_updated, id) at or before the cursor
+        # and the current version read by the scan's snapshot
 
 def register(source: CandidateSource) -> None
 def sources() -> list[CandidateSource]        # registration order
@@ -308,27 +310,38 @@ The existing beneficiary/payment summary queries and their task flow are **untou
 ```python
 record_candidate(c: Candidate, *, source: str) -> tuple[DuplicateCandidate, bool]
 ```
-`get_or_create` on the unique key. A `DISMISSED` row is never reopened. An `OPEN` row keeps the
+`get_or_create` on the unique key. A `DISMISSED` or `CONFIRMED` row is never reopened. An `OPEN` row keeps the
 higher score and merges evidence: `evidence["columns"]` becomes the union of the recorded and
 the incoming columns, so a pair matched on several identifier keys keeps every matched key; on
-any other evidence key the incoming value wins. Returns `(row, created)`.
+any other evidence key the incoming value wins. Both are written by an `UPDATE` filtered on
+`status = OPEN`, so a row another transaction resolved since the scan read it keeps its decision.
+Returns `(row, created)`.
 
 ```python
 run_scan(*, kinds: list[str] | None = None, actor: str) -> dict   # counts per kind
 scan_subject(subject_model, subject_id) -> list[DuplicateCandidate]   # on-demand, all sources
 ```
 Management command `scan_duplicates [--kind KIND]`. `run_scan` reads `ScanState`, captures
-`source.watermark()`, calls `source.scan(since)`, records, then stores the captured watermark.
-A subject written while the scan iterates is newer than the captured cursor and is revisited by
-the next scan; `record_candidate` is idempotent, so the revisit is harmless.
+`source.watermark()`, calls `source.scan(since)`, records, then stores the captured watermark,
+its snapshot under `ScanState.summary["snapshot"]`. A row committed after the snapshot was taken,
+whatever its `date_updated`, is not read by it and is revisited by the next scan;
+`record_candidate` is idempotent, so the revisit is harmless. The snapshot's rules are in the
+module README ("Scan cursor").
 
 Each source runs in its own transaction. A source that raises is logged, its candidates and its
 `ScanState` watermark are rolled back, and the other sources still run. The returned dict holds
 `{kind: count}` for the sources that completed and, only when a source failed,
-`"failed": {kind: error}`. `scan_duplicates` prints one line per source and exits non-zero
+`"failed": {kind: "<error class> (error id <id>)"}`. The error's text, which can quote a subject's
+values, is logged with that error id only; it is never returned, printed, or written to the mutation log
+or the `ScanState` row. The failure is also recorded on the source's `ScanState.summary` as
+`"last_failure": {"at", "error_class"}` (the class name of the error), in its own transaction after the
+rollback; a row created for it has no cursor and no `last_scan_at`, and an existing row keeps them. The
+error's text, which can quote a subject's value, goes to the log only. A completed scan replaces the summary,
+which clears `last_failure`. A failure to record it is logged and the other sources still run.
+`scan_duplicates` prints one line per source and exits non-zero
 (`CommandError`) when any source failed; `runDuplicateScan` records the mutation as failed with
-`deduplication.mutation.failed_to_run_scan` and the failed kinds in `detail`, after the other
-sources' candidates are recorded.
+`deduplication.mutation.failed_to_run_scan` and, in `detail`, each failed kind with its error class
+and error id, after the other sources' candidates are recorded.
 
 ```python
 resolve(candidate, *, decision: "same"|"different", keep: str | None = None, actor, note="")
@@ -367,6 +380,24 @@ is the surviving subject and the other subject is deleted; a `keep` naming the d
 refused with `deduplication.resolve.keep_contradicts_merge`. A `different` on a candidate whose
 pair already has a `CONFIRMED` sibling is refused with `deduplication.resolve.pair_already_merged`;
 the candidate stays `OPEN`.
+
+**Merge preparers.** Another module prepares a merge with `deduplication.sources.register_merge_preparer(key,
+preparer)` (`None` removes it). A preparer has two phases, run in key order:
+
+- `lock(candidate, keep)`: called by `resolve` for a `same` decision, inside its transaction and before the
+  subject locks, so the preparer can lock its own rows first in its own order. Its return value is handed to
+  `prepare` as `locked`.
+- `prepare(candidate, kept, retired, *, actor, check, locked, merge_fields) -> MergePlan(fill,
+  released_group_ids)`: called for a merge after the subject and candidate locks and before the enrolment
+  guard, so the preparer can end the retired subject's enrolment rows. `merge_fields` names the fields the
+  fill would copy or journal. `fill=False` from any preparer makes `merge_subjects` leave the kept subject
+  as it is: no fill and no `merge_conflicts` journal.
+
+A `MergeRefusal(code, details, message)` raised by either phase becomes a `ResolveRefusal` with that code and
+message; the transaction rolls back and the candidate stays `OPEN`. `check_resolve` calls `prepare` alone,
+with `check=True`, `actor` and `locked` `None`; the preparer then writes nothing, and the memberships of the
+groups it names in `released_group_ids` are not counted by the enrolment guard. With no preparer registered,
+`resolve` and `check_resolve` behave as below.
 
 ```python
 check_resolve(candidate, *, decision, keep=None) -> None   # raises ResolveRefusal, writes nothing

@@ -36,3 +36,34 @@ class LogInHelper:
             password=self._TEST_USER_PASSWORD,
             custom_props=test_data_user,
         )
+
+
+@contextmanager
+def no_merge_preparers():
+    """The merge preparers other installed modules register are set aside, so the fork's own merge is tested."""
+    from deduplication import sources
+
+    saved = dict(sources._MERGE_PREPARERS)
+    sources._MERGE_PREPARERS.clear()
+    try:
+        yield
+    finally:
+        sources._MERGE_PREPARERS.clear()
+        sources._MERGE_PREPARERS.update(saved)
+
+
+class WithoutMergePreparers:
+    """Test case mixin: the merge preparers of other installed modules are set aside for the whole class."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._merge_preparers_isolation = no_merge_preparers()
+        cls._merge_preparers_isolation.__enter__()
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            super().tearDownClass()
+        finally:
+            cls._merge_preparers_isolation.__exit__(None, None, None)

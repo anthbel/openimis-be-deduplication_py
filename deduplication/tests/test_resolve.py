@@ -7,7 +7,7 @@ from django.test.utils import CaptureQueriesContext
 from deduplication.models import DuplicateCandidate
 from deduplication.services import merge_subjects, resolve
 from deduplication.sources import order_pair
-from deduplication.tests.helpers import LogInHelper
+from deduplication.tests.helpers import LogInHelper, WithoutMergePreparers
 from individual.models import Individual
 
 
@@ -271,7 +271,7 @@ class ResolveSameSubjectsAcrossKindsTest(TestCase):
         self.assertEqual(other.status, DuplicateCandidate.Status.DISMISSED)
 
 
-class ResolveLocksSubjectsTest(TestCase):
+class ResolveLocksSubjectsTest(WithoutMergePreparers, TestCase):
     """Both subject rows are locked, in sorted id order, before the candidate row and any check."""
 
     @classmethod

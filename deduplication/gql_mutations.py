@@ -12,6 +12,7 @@ from deduplication.services import (
     create_review_tasks,
     resolve,
     run_scan,
+    scan_error,
 )
 
 
@@ -135,10 +136,11 @@ class RunDuplicateScanMutation(OpenIMISMutation):
                     }]
             return None
         except Exception as exc:
+            # The mutation log keeps the error class and id; the text, which can quote values, is logged only.
             return [
                 {
                     'message': "deduplication.mutation.failed_to_run_scan",
-                    'detail': str(exc)
+                    'detail': scan_error("Duplicate scan mutation failed", exc),
                 }]
 
 
