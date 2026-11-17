@@ -1,3 +1,5 @@
+import json
+import uuid
 from unittest import skipUnless
 
 from django.apps import apps
@@ -210,6 +212,155 @@ class MergeDuplicateBeneficiariesEnrolmentTest(TestCase):
         self.assertEqual(self.oldest.status, BeneficiaryStatus.SUSPENDED)
         self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
 
+    def _complete_with_resolve_data(self, resolve_data, task_ids=None):
+        """Completes, as ``self.user``, a review task of ``task_ids`` (the two rows by default) whose
+        additional_resolve_data is ``resolve_data``."""
+        task = Task(source=CreateDeduplicationReviewTasksService.get_class_name(), executor_action_event="x",
+                    business_event="", data={"ids": task_ids or self._pair_ids()}, status=Task.Status.ACCEPTED,
+                    json_ext={"additional_resolve_data": resolve_data})
+        task.save(username=self.user.username)
+        result = TaskService(self.user).complete_task({"id": str(task.id)})
+        self.assertTrue(result["success"], result)
+        return Task.objects.get(id=task.id)
+
+    def _pair_ids(self):
+        return [str(self.oldest.id), str(self.other.id)]
+
+    def test_a_reviewer_id_outside_the_task_fails_it_and_nothing_is_merged(self):
+        stranger = self._beneficiary("Stranger", BeneficiaryStatus.POTENTIAL, {"k1": "s"})
+        task = self._complete_with_resolve_data({str(self.user.id): {
+            "values": {"k1": "v2"}, "beneficiaryIds": self._pair_ids() + [str(stranger.id)]}})
+
+        self.assertFailedWith(task, f"not in the review task: {stranger.id}")
+        self._refresh()
+        stranger.refresh_from_db()
+        self.assertFalse(self.other.is_deleted)
+        self.assertFalse(stranger.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_the_rows_the_reviewer_leaves_out_of_the_merge_are_kept(self):
+        third = self._beneficiary("Third", BeneficiaryStatus.POTENTIAL, {"k1": "t"})
+        task = self._complete_with_resolve_data(
+            {str(self.user.id): {"values": {"k1": "v2"}, "beneficiaryIds": self._pair_ids()}},
+            task_ids=self._pair_ids() + [str(third.id)])
+
+        self.assertCompleted(task)
+        self._refresh()
+        third.refresh_from_db()
+        self.assertTrue(self.other.is_deleted)
+        self.assertFalse(third.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v2", "mark": "m"})
+
+    def test_a_merge_of_no_beneficiary_fails_its_task(self):
+        task = self._complete_with_resolve_data(
+            {str(self.user.id): {"values": {"k1": "v2"}, "beneficiaryIds": []}})
+
+        self.assertFailedWith(task, "recorded no merge")
+        self._refresh()
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_a_merge_of_a_single_beneficiary_fails_its_task_and_writes_nothing(self):
+        task = self._complete_with_resolve_data(
+            {str(self.user.id): {"values": {"k1": "v2"}, "beneficiaryIds": [str(self.oldest.id)]}})
+
+        self.assertFailedWith(task, "fewer than two beneficiaries")
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_a_merge_whose_other_beneficiary_is_already_deleted_fails_its_task(self):
+        self.other.delete(username=self.user.username)
+        task = self._complete_with_resolve_data(
+            {str(self.user.id): {"values": {"k1": "v2"}, "beneficiaryIds": self._pair_ids()}})
+
+        self.assertFailedWith(task, "fewer than two beneficiaries")
+        self._refresh()
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_a_deleted_beneficiary_is_neither_kept_nor_counted(self):
+        third = self._beneficiary("Third", BeneficiaryStatus.POTENTIAL, {"k1": "t"})
+        self.oldest.delete(username=self.user.username)
+        ids = self._pair_ids() + [str(third.id)]
+        task = self._complete_with_resolve_data(
+            {str(self.user.id): {"values": {"k1": "v2"}, "beneficiaryIds": ids}}, task_ids=ids)
+
+        self.assertCompleted(task)
+        self._refresh()
+        third.refresh_from_db()
+        self.assertTrue(third.is_deleted)
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.other.json_ext, {"k1": "v2"})
+
+    def test_approvers_recording_different_merges_fail_the_task_without_naming_a_value(self):
+        task = self._complete_with_resolve_data({
+            str(uuid.uuid4()): {"values": {"k1": "first"}, "beneficiaryIds": self._pair_ids()},
+            str(self.user.id): {"values": {"k1": "second"}, "beneficiaryIds": self._pair_ids()},
+        })
+
+        self.assertFailedWith(task, "recorded different merges")
+        self.assertNotIn("first", task.json_ext["completion_error"])
+        self.assertNotIn("second", task.json_ext["completion_error"])
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_approvers_recording_the_same_merge_in_another_order_merge_it(self):
+        task = self._complete_with_resolve_data({
+            str(uuid.uuid4()): {"values": {"k1": "v2"}, "beneficiaryIds": self._pair_ids()},
+            str(self.user.id): {"values": {"k1": "v2"}, "beneficiaryIds": self._pair_ids()[::-1]},
+        })
+
+        self.assertCompleted(task)
+        self._refresh()
+        self.assertTrue(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v2", "mark": "m"})
+
+    def test_the_merge_another_approver_recorded_is_used_when_the_completing_user_recorded_none(self):
+        task = self._complete_with_resolve_data({
+            str(uuid.uuid4()): {"values": {"k1": "recorded"}, "beneficiaryIds": self._pair_ids()},
+            str(self.user.id): {"values": {}, "beneficiaryIds": []},
+        })
+
+        self.assertCompleted(task)
+        self._refresh()
+        self.assertTrue(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "recorded", "mark": "m"})
+
+    def _with_schema(self, schema):
+        self.plan.beneficiary_data_schema = schema
+        self.plan.save(username=self.user.username)
+
+    def test_merged_values_violating_the_plan_schema_fail_the_task(self):
+        self._with_schema({"type": "object", "properties": {"age": {"type": "integer"}}})
+        task = self._complete_with_resolve_data({str(self.user.id): {
+            "values": {"age": "twelve"}, "beneficiaryIds": self._pair_ids()}})
+
+        self.assertFailedWith(task, "age: type integer")
+        self.assertNotIn("twelve", task.json_ext["completion_error"])
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_a_merge_removing_a_required_key_fails_the_task(self):
+        self._with_schema({"type": "object", "properties": {"k1": {"type": "string"}}, "required": ["k1"]})
+        task = self._complete_with_resolve_data({str(self.user.id): {
+            "values": {"k1": ""}, "beneficiaryIds": self._pair_ids()}})
+
+        self.assertFailedWith(task, "'k1' is a required property")
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_merged_values_matching_the_plan_schema_are_written(self):
+        self._with_schema(json.dumps({"type": "object", "properties": {"age": {"type": "integer"}}}))
+        task = self._complete_with_resolve_data({str(self.user.id): {
+            "values": {"age": 12}, "beneficiaryIds": self._pair_ids()}})
+
+        self.assertCompleted(task)
+        self._refresh()
+        self.assertTrue(self.other.is_deleted)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m", "age": 12})
+
 
 @skipUnless(apps.is_installed("programme_targeting"), "programme_targeting registers the enrolment rules")
 class MergeUnderTheEnrolmentRulesTest(TestCase):
@@ -281,3 +432,43 @@ class MergeUnderTheEnrolmentRulesTest(TestCase):
         self.assertEqual(kept.status, BeneficiaryStatus.ACTIVE)
         self.assertEqual(kept.json_ext, {"k": "v"})
         self.assertTrue(other.is_deleted)
+
+    def _complete(self, task_ids, beneficiary_ids, values):
+        task = Task(source=CreateDeduplicationReviewTasksService.get_class_name(), executor_action_event="x",
+                    business_event="", data={"ids": task_ids}, status=Task.Status.ACCEPTED,
+                    json_ext={"additional_resolve_data": {str(self.user.id): {
+                        "values": values, "beneficiaryIds": beneficiary_ids}}})
+        task.save(username=self.user.username)
+        self.assertTrue(TaskService(self.user).complete_task({"id": str(task.id)})["success"])
+        return Task.objects.get(id=task.id)
+
+    def test_an_active_row_outside_the_task_is_neither_deleted_nor_freeing_the_cap(self):
+        plan = self._plan("DDROUT", 1)
+        kept = self._beneficiary(plan, "Kept", BeneficiaryStatus.POTENTIAL)
+        other = self._beneficiary(plan, "Other", BeneficiaryStatus.POTENTIAL)
+        active = self._beneficiary(plan, "Active", BeneficiaryStatus.ACTIVE)
+        pair = [str(kept.id), str(other.id)]
+        task = self._complete(pair, pair + [str(active.id)], {"status": BeneficiaryStatus.ACTIVE})
+
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertIn(f"not in the review task: {active.id}", task.json_ext["completion_error"])
+        for row in (kept, other, active):
+            row.refresh_from_db()
+        self.assertEqual((kept.status, other.is_deleted), (BeneficiaryStatus.POTENTIAL, False))
+        self.assertEqual((active.status, active.is_deleted), (BeneficiaryStatus.ACTIVE, False))
+
+    def test_an_activation_with_values_violating_the_schema_is_not_written(self):
+        plan = self._plan("DDRSCH", None)
+        plan.beneficiary_data_schema = {"type": "object", "properties": {"age": {"type": "integer"}}}
+        plan.save(username=self.user.username)
+        kept = self._beneficiary(plan, "Kept", BeneficiaryStatus.POTENTIAL, {"age": 3})
+        other = self._beneficiary(plan, "Other", BeneficiaryStatus.POTENTIAL)
+        pair = [str(kept.id), str(other.id)]
+        task = self._complete(pair, pair, {"status": BeneficiaryStatus.ACTIVE, "age": "x"})
+
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertIn("age: type integer", task.json_ext["completion_error"])
+        kept.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual((kept.status, kept.json_ext), (BeneficiaryStatus.POTENTIAL, {"age": 3}))
+        self.assertFalse(other.is_deleted)

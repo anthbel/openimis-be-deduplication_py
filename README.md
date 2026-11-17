@@ -23,23 +23,42 @@ reader without 900101: each beneficiary or benefit row, its person, and the summ
 
 A summary row is given only when the user may see every beneficiary (`Beneficiary.get_queryset`)
 or every benefit's person (`Individual.get_queryset`) of its `ids`; a row with one record out of
-the user's locations is left out. `createDeduplicationTasks` applies the same rule to the rows it is given:
-a row naming a beneficiary the user may not see gets no review task, and the other rows get theirs.
+the user's locations is left out. `createDeduplicationTasks` and `createDeduplicationPaymentTasks` apply
+the same rule to the rows they are given: a row naming a beneficiary, or a benefit whose person, the user
+may not see gets no review task (and its benefits are not flagged `duplicated`), and the other rows get theirs.
 
 A beneficiary review task records in `data.current_state` the `status` and `version` of each of
 its beneficiaries when it is created.
 
-`merge_duplicate_beneficiaries` (completion of a beneficiary review task) runs between the
+Each approver who resolves a review task leaves an entry, keyed by user id, in `additional_resolve_data`
+of its `json_ext`. The selection of the task is the entry that records one (non-empty `beneficiaryIds`, or
+`benefitIds` for a payment task): an approver resolving a task another approver already resolved sends an
+empty selection. When no approver recorded a selection, or several recorded different ones (ids or values),
+the completion is refused; the reason names no value.
+
+`merge_duplicate_beneficiaries` (completion of a beneficiary review task) merges that selection
+(`{"values", "beneficiaryIds"}`): `beneficiaryIds` are among the task's own `data.ids` (the rows the
+reviewer leaves out of the merge are kept), and two or more of them are not deleted (a row deleted since
+the task was created, by another merge among others, takes no part). It runs between the
 enrolment hooks of the beneficiaries' benefit plans (`social_protection.enrolment_hooks.enrolment_write`):
 it deletes the other beneficiaries, then writes the merged `status` and `json_ext` of the oldest one
 through `BeneficiaryService.update`, sending each only when the merge changes it, so the hooks'
 `before_service_write` checks and adjusts that write as for the service's other callers. It writes
-nothing when the completing user may not see one of the beneficiaries (`Beneficiary.get_queryset`),
+nothing when the selection is refused as above, names a beneficiary the task does not or fewer
+than two undeleted ones, when the completing user may not see one of the beneficiaries (`Beneficiary.get_queryset`),
 when the kept beneficiary no longer has the `status` and `version` its task recorded (a write since
 the task was created, such as a suspension, calls for a new review; a task without `current_state`
-is not checked), or when a hook refuses the write. A refused or failed merge rolls back whole and the task
-ends `FAILED` instead of `COMPLETED`, with the reason under `completion_error` of its `json_ext` (as
-`tasks_management` does for a refused approval).
+is not checked), when the merged `json_ext` it writes does not satisfy the plan's
+`beneficiary_data_schema` (JSON Schema draft 7, the whole `json_ext` checked; the reason names the
+property and the rule, not the value), or when a hook refuses the write. A refused or failed merge rolls
+back whole and the task ends `FAILED` instead of `COMPLETED`, with the reason under `completion_error` of
+its `json_ext` (as `tasks_management` does for a refused approval).
+
+`remove_duplicate_benefit_payments` (completion of a payment review task) removes the selection's
+`benefitIds` with their attachments, bills, bill lines and payroll links. It removes nothing when the
+selection is refused as above, names a benefit the task does not, or when the completing user may not see
+the person of one of the benefits it removes (`Individual.get_queryset`);
+a refused or failed removal rolls back whole and fails the task the same way.
 
 ## Candidate sources
 
