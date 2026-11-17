@@ -47,15 +47,18 @@ ends `FAILED` instead of `COMPLETED`, with the reason under `completion_error` o
 feed duplicate-subject candidates into this module, without a hard dependency in either
 direction:
 
-- `Watermark(updated_at, last_id)` — a scan cursor.
+- `Watermark(updated_at, last_id, snapshot)` — a scan cursor. `snapshot` (`ReadSnapshot`,
+  `deduplication/sources/snapshot.py`) records which row versions of the source's table the scan
+  read; a cursor without one cannot tell a row committed after its scan from a row it read.
 - `Candidate(subject_model, subject_a, subject_b, kind, score, evidence)` — one suspected
   duplicate pair; `subject_a < subject_b` as strings, `kind` identifies the detector
   (`"demographic"`, `"identifier"`, `"biometric"`, or any other registered kind).
 - `CandidateSource` — ABC with `scan(since)` and `watermark()`, and `covered(subject_model, subject_ids,
   state)`, which returns the ids among `subject_ids`, as passed, that the source's last scan covered,
   `state` being its `ScanState` row. The default is the rule of the subject sources: a subject is covered
-  when its `(date_updated, id)` is at or before the cursor; an empty cursor covers nobody. A source whose
-  cursor is not a subject's (`biometric`) overrides it.
+  when its `(date_updated, id)` is at or before the cursor and the scan's snapshot read its current
+  version; an empty cursor, or a state without a snapshot, covers nobody. A source whose cursor is not a
+  subject's (`biometric`) overrides it.
 - `register(source)` / `sources()` — a process-wide registry, in registration order.
 - `order_pair(a, b)` — sorts two subject ids into the canonical `(a, b)` order.
 - `register_subject_filter(key, subject_filter)` — registers
@@ -137,6 +140,50 @@ Services (`deduplication/services.py`):
   `task.json_ext["additional_resolve_data"]` (`{"decision", "keep", "note"}`); when the
   completing user may not see the candidate, the completion is refused
   (`deduplication.resolve.candidate_out_of_scope`).
+
+## Scan cursor
+
+Requires PostgreSQL 13 or later (`pg_current_snapshot`, `pg_snapshot_xip`,
+`pg_current_xact_id_if_assigned`, `pg_control_system`).
+
+A row's `date_updated` is stamped when it is saved, not when its transaction commits, so a
+row can commit after a scan with a stamp before that scan's cursor. A scan therefore also
+keeps, in `ScanState.summary["snapshot"]`, a `ReadSnapshot` of the source's table, taken
+before it reads anything:
+
+- `xmin`: the lowest PostgreSQL transaction id still running on the database server, other
+  than the scan's own transaction, or the scan's own transaction id when that is lower.
+  Every row version with a lower transaction id was committed (or rolled back) before the
+  scan read anything.
+- `seen`: the versions (`"xmin:ctid"`) already visible that do not count as old, including
+  the versions the scan's own transaction wrote before it; at most `SEEN_LIMIT` (10 000) of
+  them.
+- `system`: the database cluster's system identifier.
+
+A row version counts as old when its transaction id is below `xmin`, or when it unwraps at
+or above the current statement's xmax without being the current transaction's own (a
+version frozen more than 2^31 transactions ago: the 32-bit `xmin` is unwrapped in the 2^32
+window around the current transaction id, and a running transaction's rows are not
+visible). A version is read by the scan when it counts as old or it is in `seen`, in the
+same cluster. The next scan of the source revisits every row whose current version that
+scan did not read, as well as every row past the `(date_updated, id)` cursor, however long
+the writing transaction ran. A subject source covers a subject only when the last scan read
+its current version and its `(date_updated, id)` is at or before the cursor.
+
+- `xmin` is the oldest running transaction of the whole database server, whatever database
+  or table it writes. While one stays open, every version written after it starts is kept
+  in `seen`; beyond `SEEN_LIMIT` the rest count as not read: their rows are scanned again
+  and cover nobody until a later scan reads them. Each scan that leaves versions out logs a
+  warning (`deduplication.sources.snapshot`) with how many and how many transaction ids ago
+  the oldest running transaction started. Look for it in `pg_stat_activity` (`backend_xid`,
+  `backend_xmin`, `xact_start`, `state = 'idle in transaction'`) and end it.
+- A version written after the snapshot by the scan's own transaction counts as not read.
+- A snapshot of another cluster (the database restored elsewhere) reads nothing: the next
+  scan revisits every row and nobody is covered until it completes.
+- A cursor kept without a snapshot (a `ScanState` written before snapshots were kept)
+  covers nobody, and the next scan of the source revisits every row.
+- Inside a transaction that already has an id, a frozen version that unwraps at or above
+  that id counts as old only through `seen`.
 
 ## Merge policy
 

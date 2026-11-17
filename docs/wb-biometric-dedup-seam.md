@@ -39,6 +39,7 @@ Config: `BIOMETRIC["SUBJECT_MODEL"]` and `DEDUPLICATION["SUBJECT_MODEL"]`, both 
 class Watermark:
     updated_at: datetime | None = None
     last_id: str | None = None
+    snapshot: ReadSnapshot | None = None   # row versions the scan read (deduplication/sources/snapshot.py)
 
 @dataclass(frozen=True)
 class Candidate:
@@ -57,6 +58,7 @@ class CandidateSource(abc.ABC):
     def watermark(self) -> Watermark: ...      # where the next scan starts
     def covered(self, subject_model: str, subject_ids, state) -> set: ...
         # the ids, as passed, its last scan covered; default: (date_updated, id) at or before the cursor
+        # and the current version read by the scan's snapshot
 
 def register(source: CandidateSource) -> None
 def sources() -> list[CandidateSource]        # registration order
@@ -318,9 +320,11 @@ run_scan(*, kinds: list[str] | None = None, actor: str) -> dict   # counts per k
 scan_subject(subject_model, subject_id) -> list[DuplicateCandidate]   # on-demand, all sources
 ```
 Management command `scan_duplicates [--kind KIND]`. `run_scan` reads `ScanState`, captures
-`source.watermark()`, calls `source.scan(since)`, records, then stores the captured watermark.
-A subject written while the scan iterates is newer than the captured cursor and is revisited by
-the next scan; `record_candidate` is idempotent, so the revisit is harmless.
+`source.watermark()`, calls `source.scan(since)`, records, then stores the captured watermark,
+its snapshot under `ScanState.summary["snapshot"]`. A row committed after the snapshot was taken,
+whatever its `date_updated`, is not read by it and is revisited by the next scan;
+`record_candidate` is idempotent, so the revisit is harmless. The snapshot's rules are in the
+module README ("Scan cursor").
 
 Each source runs in its own transaction. A source that raises is logged, its candidates and its
 `ScanState` watermark are rolled back, and the other sources still run. The returned dict holds

@@ -8,12 +8,17 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set
 
+from deduplication.sources.snapshot import ReadSnapshot
+
 
 @dataclass(frozen=True)
 class Watermark:
-    """Cursor a source resumes scanning from; both fields None means 'from the start'."""
+    """Cursor a source resumes scanning from; updated_at and last_id both None means 'from the start'.
+    ``snapshot`` holds the row versions the scan that took the cursor read; a cursor without one cannot tell a
+    row committed after that scan from a row it read."""
     updated_at: Optional[datetime] = None
     last_id: Optional[str] = None
+    snapshot: Optional[ReadSnapshot] = None
 
 
 @dataclass(frozen=True)
@@ -44,7 +49,8 @@ class CandidateSource(abc.ABC):
     def covered(self, subject_model: str, subject_ids: Iterable, state) -> Set:
         """The ids among ``subject_ids``, as passed, that this source's last scan covered; ``state`` is the
         source's ScanState row. The default is the rule of subject sources: a subject is covered when its
-        ``(date_updated, id)`` is at or before the cursor, and an empty cursor covers nobody."""
+        ``(date_updated, id)`` is at or before the cursor and the scan's snapshot read its current version, and an
+        empty cursor covers nobody."""
         from deduplication.sources.subject import subject_covered
 
         return subject_covered(subject_model, subject_ids, state)
