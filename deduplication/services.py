@@ -4,7 +4,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Union, Tuple, Type
 from datetime import datetime
+import json
 
+import jsonschema
 from django.apps import apps
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.core.exceptions import ValidationError
@@ -193,6 +195,10 @@ class CreateDeduplicationPaymentReviewTasksService:
             tasks = []
             payment_cycle = PaymentCycle.objects.get(id=payment_cycle_id)
             for task_data in summary:
+                # A row naming a benefit whose person is out of the user's locations is left out, as the summary
+                # leaves it out.
+                if _benefits_out_of_scope(task_data.get('ids') or [], self.user):
+                    continue
                 self.validation_class.validate_create_deduplication_task(task_data, self.get_class_name())
                 create_task_data = {
                     'source': self.get_class_name(),
@@ -428,6 +434,7 @@ def _update_merged_beneficiary(beneficiary, beneficiary_kwargs, json_ext_kwargs,
         obj_data['status'] = beneficiary_kwargs['status']
     json_ext = _merged_json_ext(beneficiary.json_ext, json_ext_kwargs)
     if json_ext != (beneficiary.json_ext or {}):
+        _require_json_ext_in_plan_schema(beneficiary, json_ext)
         obj_data['json_ext'] = json_ext
     if not obj_data:
         return
@@ -435,6 +442,30 @@ def _update_merged_beneficiary(beneficiary, beneficiary_kwargs, json_ext_kwargs,
     result = BeneficiaryService(user).update(obj_data)
     if not result.get('success'):
         raise ValidationError(f"{result.get('message')}: {result.get('detail')}")
+
+
+def _schema_violation(error):
+    """The property a json_ext schema error bears on and the rule it breaks, without the value, which may be
+    masked data."""
+    if error.validator in ('required', 'additionalProperties'):
+        return error.message
+    where = '/'.join(str(part) for part in error.absolute_path) or 'json_ext'
+    return f"{where}: {error.validator} {error.validator_value}"
+
+
+def _require_json_ext_in_plan_schema(beneficiary, json_ext):
+    """Raises ValidationError when ``json_ext`` does not satisfy the ``beneficiary_data_schema`` (JSON Schema,
+    draft 7) of the benefit plan of ``beneficiary``. A plan without a schema accepts any json_ext."""
+    schema = beneficiary.benefit_plan.beneficiary_data_schema
+    if isinstance(schema, str):
+        schema = json.loads(schema)
+    if not schema:
+        return
+    errors = sorted(jsonschema.Draft7Validator(schema).iter_errors(json_ext), key=_schema_violation)
+    if errors:
+        raise ValidationError(
+            f"The merged values of beneficiary {beneficiary.id} do not match the beneficiary data schema "
+            f"of its benefit plan: {'; '.join(_schema_violation(error) for error in errors)}")
 
 
 def _beneficiaries_out_of_scope(beneficiary_ids, user):
@@ -450,6 +481,24 @@ def _require_beneficiaries_in_scope(beneficiary_ids, user):
     out_of_scope = _beneficiaries_out_of_scope(beneficiary_ids, user)
     if out_of_scope:
         raise ValidationError(f"Beneficiaries out of the user's locations: {', '.join(out_of_scope)}")
+
+
+def _benefits_out_of_scope(benefit_ids, user):
+    """The ids, sorted, of the existing benefits among ``benefit_ids`` whose person ``user`` may not see
+    (``Individual.get_queryset``), the rule of the benefit duplicate summary."""
+    rows = BenefitConsumption.objects.filter(id__in=benefit_ids)
+    visible = set(rows.filter(individual__in=Individual.get_queryset(None, user)).values_list('id', flat=True))
+    return sorted(str(row_id) for row_id in rows.values_list('id', flat=True) if row_id not in visible)
+
+
+def _completing_user_resolve_data(task_data, user):
+    """The data ``user``, who completes the review task, recorded when resolving it: its entry, keyed by user id,
+    in ``additional_resolve_data`` of the task's json_ext. Raises ValidationError when there is none."""
+    additional_resolve_data = (task_data.get("json_ext") or {}).get("additional_resolve_data") or {}
+    resolve_data = additional_resolve_data.get(str(user.id))
+    if not isinstance(resolve_data, dict):
+        raise ValidationError("The user who completed the review task recorded no merge")
+    return resolve_data
 
 
 def _require_unchanged_since_task(beneficiary, task_state):
@@ -470,21 +519,30 @@ def _require_unchanged_since_task(beneficiary, task_state):
 def merge_duplicate_beneficiaries(task_data, user_id):
     """Merges the beneficiaries of a completed review task into the oldest one, between the enrolment hooks of
     their benefit plans (``enrolment_hooks.enrolment_write``): the other rows are deleted first, then the merged
-    values are written. It is refused (ValidationError, nothing written) when the user may not see one of the
-    beneficiaries, when the kept one changed since the task was created, or when a hook refuses it."""
+    values are written. The beneficiaries and values are those the completing user recorded
+    (``_completing_user_resolve_data``), the beneficiaries being two or more undeleted ones of the task's own
+    ``ids``. It is refused (ValidationError, nothing written) when the completing user recorded no merge, names
+    a beneficiary the task does not, or fewer than two undeleted ones; when the user may not see one of the
+    beneficiaries; when the kept one changed since the task was created; when the merged json_ext breaks the
+    plan's ``beneficiary_data_schema``; or when a hook refuses it."""
     individual_fields = {"first_name", "last_name", "dob"}
     beneficiary_fields = {"status"}
 
     user = User.objects.get(id=user_id)
-    # additional_resolve_data is a key in task__json_ext that stores data selected by user during resolving a task
-    additional_resolve_data = task_data.get("json_ext", {}).get("additional_resolve_data", {})
-    merge_data = list(additional_resolve_data.values())[0]
-    field_values = merge_data.get('values', {})
-    beneficiary_ids = merge_data.get("beneficiaryIds", [])
+    merge_data = _completing_user_resolve_data(task_data, user)
+    field_values = merge_data.get('values') or {}
+    beneficiary_ids = [str(beneficiary_id) for beneficiary_id in merge_data.get("beneficiaryIds") or []]
+    task_ids = {str(beneficiary_id) for beneficiary_id in (task_data.get('data') or {}).get('ids') or []}
+    not_in_task = sorted(set(beneficiary_ids) - task_ids)
+    if not_in_task:
+        raise ValidationError(f"Beneficiaries not in the review task: {', '.join(not_in_task)}")
+    # A beneficiary deleted since the task was created, by another merge among others, takes no part.
+    live_beneficiaries = Beneficiary.objects.filter(id__in=beneficiary_ids, is_deleted=False)
+    beneficiary_ids = [str(beneficiary_id) for beneficiary_id in live_beneficiaries.values_list('id', flat=True)]
+    if len(beneficiary_ids) < 2:
+        raise ValidationError("The merge names fewer than two beneficiaries of the review task")
 
-    oldest_record_beneficiary = Beneficiary.objects.filter(id__in=beneficiary_ids).order_by('date_created').first()
-    if oldest_record_beneficiary is None:
-        return  # No beneficiaries found to merge
+    oldest_record_beneficiary = live_beneficiaries.order_by('date_created').first()
 
     individual_kwargs = {}
     beneficiary_kwargs = {}
@@ -513,15 +571,15 @@ def merge_duplicate_beneficiaries(task_data, user_id):
         _update_merged_beneficiary(oldest_record_beneficiary, beneficiary_kwargs, json_kwargs, user)
 
 
-def _merge_refusal(task, user):
-    """Merges the beneficiaries of the completed review ``task``: the reason the merge was refused or failed, with
-    nothing written, or None once it is written."""
+def _completion_refusal(task, write, *args):
+    """Runs ``write(*args)``, the atomic write of the completed review ``task``: the reason it was refused or
+    failed, with nothing written, or None once it is written."""
     try:
-        merge_duplicate_beneficiaries(task, user.id)
+        write(*args)
     except ValidationError as exc:
         return "; ".join(exc.messages)
     except Exception as exc:
-        logger.error("Error while merging the beneficiaries of review task %s", task.get('id'), exc_info=exc)
+        logger.error("Error while completing review task %s", task.get('id'), exc_info=exc)
         return str(exc) or exc.__class__.__name__
     return None
 
@@ -537,7 +595,7 @@ def on_deduplication_task_complete_service_handler(**kwargs):
         if (result and result['success'] and task['status'] == Task.Status.COMPLETED
                 and source == CreateDeduplicationReviewTasksService.get_class_name()):
             user = User.objects.get(id=user_id)
-            refusal = _merge_refusal(task, user)
+            refusal = _completion_refusal(task, merge_duplicate_beneficiaries, task, user.id)
             if refusal:
                 _fail_completed_task(task['id'], user, refusal)
                 return [refusal]
@@ -547,11 +605,17 @@ def on_deduplication_task_complete_service_handler(**kwargs):
 
 
 @transaction.atomic
-def remove_duplicate_benefit_payments(task_data):
+def remove_duplicate_benefit_payments(task_data, user):
+    """Removes the benefits chosen on a completed payment review task, with their attachments, bills and payroll
+    links. It is refused (ValidationError, nothing removed) when ``user``, who completes the task, may not see the
+    person of one of the benefits."""
     # additional_resolve_data is a key in task__json_ext that stores data selected by user during resolving a task
     additional_resolve_data = task_data.get("json_ext", {}).get("additional_resolve_data", {})
     merge_data = list(additional_resolve_data.values())[0]
     benefit_ids = merge_data.get("benefitIds", [])
+    out_of_scope = _benefits_out_of_scope(benefit_ids, user)
+    if out_of_scope:
+        raise ValidationError(f"Benefits out of the user's locations: {', '.join(out_of_scope)}")
     benefits_to_delete = BenefitConsumption.objects.filter(id__in=benefit_ids)\
         .values_list('id', 'benefitattachment__bill')
     if len(benefits_to_delete) > 0:
@@ -578,13 +642,20 @@ def remove_duplicate_benefit_payments(task_data):
 
 
 def on_payment_benefit_deduplication_task_complete_service_handler(**kwargs):
+    """After complete_task, removes the benefits chosen on a completed payment review task. A refused or failed
+    removal sets the task FAILED with the reason under ``completion_error`` of its json_ext."""
     try:
         result = kwargs.get('result', {})
         task = result['data']['task']
         source = result['data']['task']["source"]
+        user_id = result['data']['user']["id"]
         if (result and result['success'] and task['status'] == Task.Status.COMPLETED
                 and source == CreateDeduplicationPaymentReviewTasksService.get_class_name()):
-            remove_duplicate_benefit_payments(task)
+            user = User.objects.get(id=user_id)
+            refusal = _completion_refusal(task, remove_duplicate_benefit_payments, task, user)
+            if refusal:
+                _fail_completed_task(task['id'], user, refusal)
+                return [refusal]
     except Exception as e:
         logger.error("Error while executing on_task_complete", exc_info=e)
         return [str(e)]
