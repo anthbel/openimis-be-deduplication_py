@@ -23,6 +23,17 @@ from deduplication.services import ResolveRefusal, check_resolve
 from individual.data_masking import may_see_masked
 
 
+def _rows_in_scope(rows, visible):
+    """The summary rows all of whose ``ids`` are among the ids of ``visible(ids)``, the queryset of the rows
+    the user may see among ``ids``: a row with any record out of the user's reach is left out."""
+    rows = list(rows)
+    ids = {row_id for row in rows for row_id in row["ids"]}
+    if not ids:
+        return rows
+    seen = set(visible(ids).values_list("id", flat=True))
+    return [row for row in rows if all(row_id in seen for row_id in row["ids"])]
+
+
 class MaskedCandidateConnectionField(OrderedDjangoFilterConnectionField):
     """Core's ordered connection leaving out, for a user without the masked-data right, the ``orderBy`` terms
     that order by the evidence (``unmasked_candidate_order_by``)."""
@@ -90,6 +101,8 @@ class Query(graphene.ObjectType):
         individual_columns = ['first_name', 'last_name', 'dob']
         columns = [f'individual__{column}' if column in individual_columns else column for column in columns]
         aggr = get_beneficiary_duplication_aggregation(columns=columns, benefit_plan_id=benefit_plan_id)
+        aggr = _rows_in_scope(aggr, lambda ids: Beneficiary.get_queryset(
+            Beneficiary.objects.filter(id__in=ids), info.context.user))
         masked = not may_see_masked(info.context.user)
         rows = list()
         for row in aggr:
@@ -107,6 +120,7 @@ class Query(graphene.ObjectType):
 
     def resolve_benefit_deduplication_summary(self, info, columns=None, payment_cycle_id=None, **kwargs):
         from social_protection.apps import SocialProtectionConfig
+        from individual.models import Individual
         from payroll.models import BenefitConsumption
         from deduplication.services import get_benefit_consumption_duplication_aggregation
 
@@ -125,6 +139,8 @@ class Query(graphene.ObjectType):
 
         # Fetch the aggregation data
         aggr = get_benefit_consumption_duplication_aggregation(columns=columns, payment_cycle_id=payment_cycle_id)
+        aggr = _rows_in_scope(aggr, lambda ids: BenefitConsumption.objects.filter(
+            id__in=ids, individual__in=Individual.get_queryset(None, info.context.user)))
         masked = not may_see_masked(info.context.user)
         rows = []
         for row in aggr:
@@ -158,7 +174,7 @@ class Query(graphene.ObjectType):
 
         if decision not in ('same', 'different'):
             raise ValueError("deduplication.mutation.invalid_decision")
-        candidate = DuplicateCandidate.objects.get(id=candidate_id)
+        candidate = DuplicateCandidate.get_queryset(None, info.context.user).get(id=candidate_id)
         try:
             check_resolve(candidate, decision=decision, keep=keep)
         except ResolveRefusal as refusal:

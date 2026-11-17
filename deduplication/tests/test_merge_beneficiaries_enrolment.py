@@ -1,0 +1,283 @@
+from unittest import skipUnless
+
+from django.apps import apps
+from django.core.exceptions import ValidationError
+from django.test import TestCase
+
+from deduplication.services import CreateDeduplicationReviewTasksService
+from deduplication.tests.helpers import LogInHelper
+from individual.models import Individual
+from social_protection import enrolment_hooks
+from social_protection.models import Beneficiary, BeneficiaryStatus, BenefitPlan
+from tasks_management.models import Task
+from tasks_management.services import TaskService
+
+
+class _RecordingHook:
+    """An enrolment hook that records its calls; ``refuse`` makes ``after_write`` raise, ``drop_key`` makes
+    ``before_service_write`` remove that json_ext key from the payload."""
+
+    def __init__(self, refuse=False, drop_key=None):
+        self.refuse = refuse
+        self.drop_key = drop_key
+        self.calls = []
+
+    def before_service_write(self, model, obj_data, creating):
+        self.calls.append(("service", model, dict(obj_data), creating))
+        if self.drop_key and isinstance(obj_data.get("json_ext"), dict):
+            obj_data["json_ext"] = {k: v for k, v in obj_data["json_ext"].items() if k != self.drop_key}
+
+    def before_write(self, model, plan_ids):
+        self.calls.append(("before", model, list(plan_ids)))
+        return "state"
+
+    def after_write(self, model, plan_ids, state):
+        self.calls.append(("after", model, list(plan_ids), state))
+        if self.refuse:
+            raise ValidationError("refused by the hook")
+
+
+class MergeDuplicateBeneficiariesEnrolmentTest(TestCase):
+    """Completing a beneficiary review task merges the beneficiaries through the enrolment hooks."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = LogInHelper().get_or_create_user_api()
+
+    def setUp(self):
+        self.plan = BenefitPlan(code="DDMRG", name="DDMRG", type=BenefitPlan.BenefitPlanType.INDIVIDUAL_TYPE,
+                                beneficiary_data_schema={}, max_beneficiaries=1)
+        self.plan.save(username=self.user.username)
+        self.oldest = self._beneficiary("Old", BeneficiaryStatus.POTENTIAL, {"k1": "v1", "mark": "m"})
+        self.other = self._beneficiary("New", BeneficiaryStatus.POTENTIAL, {"k1": "v1"})
+
+    def _beneficiary(self, name, status, json_ext):
+        person = Individual(first_name=name, last_name="Dup", dob="1990-01-01")
+        person.save(username=self.user.username)
+        beneficiary = Beneficiary(individual=person, benefit_plan=self.plan, status=status, json_ext=json_ext)
+        beneficiary.save(username=self.user.username)
+        return beneficiary
+
+    def _hook(self, **kwargs):
+        hook = _RecordingHook(**kwargs)
+        enrolment_hooks.register_enrolment_hook(hook)
+        self.addCleanup(enrolment_hooks.unregister_enrolment_hook, hook)
+        return hook
+
+    def _complete_review_task(self, values, task=None):
+        ids = [str(self.oldest.id), str(self.other.id)]
+        if task is None:
+            task = Task(source=CreateDeduplicationReviewTasksService.get_class_name(), executor_action_event="x",
+                        business_event="", data={"ids": ids})
+        task.status = Task.Status.ACCEPTED
+        task.json_ext = {"additional_resolve_data": {str(self.user.id): {"values": values, "beneficiaryIds": ids}}}
+        task.save(username=self.user.username)
+        result = TaskService(self.user).complete_task({"id": str(task.id)})
+        self.assertTrue(result["success"], result)
+        return Task.objects.get(id=task.id)
+
+    def assertFailedWith(self, task, reason):
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertIn(reason, task.json_ext["completion_error"])
+
+    def assertCompleted(self, task):
+        self.assertEqual(task.status, Task.Status.COMPLETED)
+        self.assertNotIn("completion_error", task.json_ext or {})
+
+    def _created_review_task(self):
+        result = CreateDeduplicationReviewTasksService(self.user).create_beneficiary_duplication_tasks(
+            [{"ids": [str(self.oldest.id), str(self.other.id)], "count": 2,
+              "column_values": {"individual__last_name": "Dup"}}])
+        self.assertTrue(result["success"], result)
+        return Task.objects.get(id=result["data"][0]["data"]["id"])
+
+    def _refresh(self):
+        self.oldest.refresh_from_db()
+        self.other.refresh_from_db()
+
+    def test_merge_runs_between_the_hooks_of_the_plan_and_writes_through_the_service(self):
+        hook = self._hook()
+        self._complete_review_task({"status": BeneficiaryStatus.ACTIVE, "k1": "v2"})
+
+        self._refresh()
+        self.assertTrue(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.ACTIVE)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v2", "mark": "m"})
+        kinds = [call[0] for call in hook.calls]
+        self.assertEqual(kinds, ["before", "service", "after"])
+        self.assertEqual(hook.calls[0][1:], (Beneficiary, [str(self.plan.id)]))
+        _, model, obj_data, creating = hook.calls[1]
+        self.assertIs(model, Beneficiary)
+        self.assertFalse(creating)
+        self.assertEqual(obj_data["id"], str(self.oldest.id))
+        self.assertEqual(obj_data["status"], BeneficiaryStatus.ACTIVE)
+        self.assertEqual(hook.calls[2][1:], (Beneficiary, [str(self.plan.id)], "state"))
+
+    def test_the_payload_the_service_hook_adjusts_is_the_one_saved(self):
+        self._hook(drop_key="mark")
+        self._complete_review_task({"status": BeneficiaryStatus.ACTIVE, "k2": "v2"})
+
+        self._refresh()
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.ACTIVE)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "k2": "v2"})
+
+    def test_a_refusal_of_the_hooks_rolls_the_whole_merge_back(self):
+        self._hook(refuse=True)
+        self._complete_review_task({"status": BeneficiaryStatus.ACTIVE, "k1": "v2"})
+
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.POTENTIAL)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_unchanged_status_is_not_sent(self):
+        hook = self._hook()
+        self._complete_review_task({"status": BeneficiaryStatus.POTENTIAL, "k1": "v2"})
+
+        service_calls = [call for call in hook.calls if call[0] == "service"]
+        self.assertEqual(len(service_calls), 1)
+        self.assertNotIn("status", service_calls[0][2])
+        self._refresh()
+        self.assertEqual(self.oldest.json_ext, {"k1": "v2", "mark": "m"})
+
+    def test_the_merged_rows_are_deleted_before_the_kept_one_is_activated(self):
+        # The plan's cap is 1 and the row to delete is its only ACTIVE one: activating the kept row is
+        # accepted once that row is gone.
+        self.other.status = BeneficiaryStatus.ACTIVE
+        self.other.save(username=self.user.username)
+        self._complete_review_task({"status": BeneficiaryStatus.ACTIVE})
+
+        self._refresh()
+        self.assertTrue(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.ACTIVE)
+
+    def test_empty_values_merged_over_the_same_empty_values_change_nothing(self):
+        self.oldest.json_ext = {"k1": "v1", "flag": False, "n": 0}
+        self.oldest.save(username=self.user.username)
+        hook = self._hook()
+        self._complete_review_task({"flag": False, "n": 0, "absent": ""})
+
+        self.assertEqual([call for call in hook.calls if call[0] == "service"], [])
+        self._refresh()
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "flag": False, "n": 0})
+
+    def test_a_task_records_the_state_of_its_beneficiaries_and_merges_when_it_holds(self):
+        task = self._created_review_task()
+        self.assertEqual(task.data["current_state"][str(self.oldest.id)],
+                         {"status": BeneficiaryStatus.POTENTIAL, "version": self.oldest.version})
+        self._complete_review_task({"status": BeneficiaryStatus.ACTIVE}, task)
+
+        self._refresh()
+        self.assertTrue(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.ACTIVE)
+
+    def test_a_kept_beneficiary_written_since_the_task_was_created_is_not_merged(self):
+        task = self._created_review_task()
+        self.oldest.status = BeneficiaryStatus.SUSPENDED
+        self.oldest.save(username=self.user.username)
+        self._complete_review_task({"status": BeneficiaryStatus.ACTIVE}, task)
+
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.SUSPENDED)
+
+    def test_a_merge_written_completes_its_task(self):
+        task = self._complete_review_task({"status": BeneficiaryStatus.ACTIVE}, self._created_review_task())
+
+        self.assertCompleted(task)
+        self._refresh()
+        self.assertTrue(self.other.is_deleted)
+
+    def test_a_merge_the_hooks_refuse_fails_its_task_with_the_reason(self):
+        self._hook(refuse=True)
+        task = self._complete_review_task({"status": BeneficiaryStatus.ACTIVE, "k1": "v2"})
+
+        self.assertFailedWith(task, "refused by the hook")
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.POTENTIAL)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+    def test_a_merge_refused_on_a_stale_kept_row_fails_its_task_and_keeps_the_rows(self):
+        task = self._created_review_task()
+        self.oldest.status = BeneficiaryStatus.SUSPENDED
+        self.oldest.save(username=self.user.username)
+        task = self._complete_review_task({"status": BeneficiaryStatus.ACTIVE, "k1": "v2"}, task)
+
+        self.assertFailedWith(task, "changed since the review task was created")
+        self._refresh()
+        self.assertFalse(self.other.is_deleted)
+        self.assertEqual(self.oldest.status, BeneficiaryStatus.SUSPENDED)
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "mark": "m"})
+
+
+@skipUnless(apps.is_installed("programme_targeting"), "programme_targeting registers the enrolment rules")
+class MergeUnderTheEnrolmentRulesTest(TestCase):
+    """The merge under programme_targeting's enrolment rules, registered at startup."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = LogInHelper().get_or_create_user_api()
+
+    def _plan(self, code, cap):
+        plan = BenefitPlan(code=code, name=code, type=BenefitPlan.BenefitPlanType.INDIVIDUAL_TYPE,
+                           beneficiary_data_schema={}, max_beneficiaries=cap)
+        plan.save(username=self.user.username)
+        return plan
+
+    def _beneficiary(self, plan, name, status, json_ext=None):
+        person = Individual(first_name=name, last_name="Rules", dob="1990-01-01")
+        person.save(username=self.user.username)
+        beneficiary = Beneficiary(individual=person, benefit_plan=plan, status=status, json_ext=json_ext or {})
+        beneficiary.save(username=self.user.username)
+        return beneficiary
+
+    def _merge(self, kept, other, values):
+        ids = [str(kept.id), str(other.id)]
+        result = CreateDeduplicationReviewTasksService(self.user).create_beneficiary_duplication_tasks(
+            [{"ids": ids, "count": 2, "column_values": {"individual__last_name": "Rules"}}])
+        self.assertTrue(result["success"], result)
+        task = Task.objects.get(id=result["data"][0]["data"]["id"])
+        task.status = Task.Status.ACCEPTED
+        task.json_ext = {"additional_resolve_data": {str(self.user.id): {"values": values, "beneficiaryIds": ids}}}
+        task.save(username=self.user.username)
+        self.assertTrue(TaskService(self.user).complete_task({"id": str(task.id)})["success"])
+        kept.refresh_from_db()
+        other.refresh_from_db()
+        return Task.objects.get(id=task.id)
+
+    def test_a_merge_that_would_raise_the_plan_over_its_cap_is_refused(self):
+        plan = self._plan("DDRCAP", 1)
+        self._beneficiary(plan, "Active", BeneficiaryStatus.ACTIVE)
+        kept = self._beneficiary(plan, "Kept", BeneficiaryStatus.POTENTIAL)
+        other = self._beneficiary(plan, "Other", BeneficiaryStatus.POTENTIAL)
+        self._merge(kept, other, {"status": BeneficiaryStatus.ACTIVE})
+
+        self.assertEqual(kept.status, BeneficiaryStatus.POTENTIAL)
+        self.assertFalse(other.is_deleted)
+        self.assertEqual(Beneficiary.objects.filter(
+            benefit_plan=plan, is_deleted=False, status=BeneficiaryStatus.ACTIVE).count(), 1)
+
+    def test_a_merge_refused_over_the_cap_fails_its_task_with_the_reason(self):
+        plan = self._plan("DDRCAPF", 1)
+        self._beneficiary(plan, "Active", BeneficiaryStatus.ACTIVE)
+        kept = self._beneficiary(plan, "Kept", BeneficiaryStatus.POTENTIAL, {"k": "v"})
+        other = self._beneficiary(plan, "Other", BeneficiaryStatus.POTENTIAL)
+        task = self._merge(kept, other, {"status": BeneficiaryStatus.ACTIVE, "k": "w"})
+
+        self.assertEqual(task.status, Task.Status.FAILED)
+        self.assertIn("Benefit plan is already at max active beneficiaries", task.json_ext["completion_error"])
+        self.assertEqual((kept.status, kept.json_ext), (BeneficiaryStatus.POTENTIAL, {"k": "v"}))
+        self.assertFalse(other.is_deleted)
+
+    def test_activating_a_selection_suspended_row_removes_the_suspension_key(self):
+        from programme_targeting.enrolment_rules import SUSPENSION_KEY
+
+        plan = self._plan("DDRKEY", None)
+        kept = self._beneficiary(plan, "Kept", BeneficiaryStatus.SUSPENDED, {SUSPENSION_KEY: "request-1", "k": "v"})
+        other = self._beneficiary(plan, "Other", BeneficiaryStatus.POTENTIAL)
+        self._merge(kept, other, {"status": BeneficiaryStatus.ACTIVE})
+
+        self.assertEqual(kept.status, BeneficiaryStatus.ACTIVE)
+        self.assertEqual(kept.json_ext, {"k": "v"})
+        self.assertTrue(other.is_deleted)
