@@ -17,8 +17,22 @@ from deduplication.gql_queries import (
     DuplicateCandidateGQLType,
     DuplicateCandidateResolveCheckGQLType,
 )
+from deduplication.masking import mask_summary_values, unmasked_candidate_order_by
 from deduplication.models import DuplicateCandidate
 from deduplication.services import ResolveRefusal, check_resolve
+from individual.data_masking import may_see_masked
+
+
+class MaskedCandidateConnectionField(OrderedDjangoFilterConnectionField):
+    """Core's ordered connection leaving out, for a user without the masked-data right, the ``orderBy`` terms
+    that order by the evidence (``unmasked_candidate_order_by``)."""
+
+    @classmethod
+    def resolve_queryset(cls, connection, iterable, info, args, filtering_args, filterset_class):
+        if args.get("orderBy"):
+            args = {**args, "orderBy": unmasked_candidate_order_by(
+                info.context.user, filterset_class._meta.model, args["orderBy"])}
+        return super().resolve_queryset(connection, iterable, info, args, filtering_args, filterset_class)
 
 
 class Query(graphene.ObjectType):
@@ -31,7 +45,7 @@ class Query(graphene.ObjectType):
     # batch of work.
     module_name = "tasks_management"
 
-    duplicate_candidates = OrderedDjangoFilterConnectionField(
+    duplicate_candidates = MaskedCandidateConnectionField(
         DuplicateCandidateGQLType,
         orderBy=graphene.List(of_type=graphene.String),
         status=graphene.String(),
@@ -61,6 +75,7 @@ class Query(graphene.ObjectType):
 
     def resolve_beneficiary_deduplication_summary(self, info, columns=None, benefit_plan_id=None, **kwargs):
         from social_protection.apps import SocialProtectionConfig
+        from social_protection.models import Beneficiary
         from deduplication.services import get_beneficiary_duplication_aggregation
 
         # A borrowing of another module's right, unjustified from the start and left
@@ -75,6 +90,7 @@ class Query(graphene.ObjectType):
         individual_columns = ['first_name', 'last_name', 'dob']
         columns = [f'individual__{column}' if column in individual_columns else column for column in columns]
         aggr = get_beneficiary_duplication_aggregation(columns=columns, benefit_plan_id=benefit_plan_id)
+        masked = not may_see_masked(info.context.user)
         rows = list()
         for row in aggr:
             individual_columns = [f'individual__{column}' for column in individual_columns]
@@ -83,12 +99,15 @@ class Query(graphene.ObjectType):
             row_column_values = {column: str(row[column])
                                  for
                                  column in row}
+            if masked:
+                mask_summary_values(Beneficiary, row_column_values, person='individual')
             rows.append(DeduplicationSummaryRowGQLType(column_values=row_column_values, count=count, ids=ids))
 
         return DeduplicationSummaryGQLType(rows=rows)
 
     def resolve_benefit_deduplication_summary(self, info, columns=None, payment_cycle_id=None, **kwargs):
         from social_protection.apps import SocialProtectionConfig
+        from payroll.models import BenefitConsumption
         from deduplication.services import get_benefit_consumption_duplication_aggregation
 
         # Check permissions
@@ -106,11 +125,14 @@ class Query(graphene.ObjectType):
 
         # Fetch the aggregation data
         aggr = get_benefit_consumption_duplication_aggregation(columns=columns, payment_cycle_id=payment_cycle_id)
+        masked = not may_see_masked(info.context.user)
         rows = []
         for row in aggr:
             count = row.pop('id_count')
             ids = row.pop('ids')
             row_column_values = {column: str(row[column]) for column in row}
+            if masked:
+                mask_summary_values(BenefitConsumption, row_column_values, person='individual')
             rows.append(DeduplicationSummaryRowGQLType(column_values=row_column_values, count=count, ids=ids))
 
         return DeduplicationSummaryGQLType(rows=rows)

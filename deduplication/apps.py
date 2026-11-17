@@ -86,6 +86,7 @@ class DeduplicationConfig(AppConfig):
         self.__load_config(cfg)
         self.__register_builtin_sources()
         self.__connect_task_bridge()
+        self.__register_review_task_maskers()
 
     @classmethod
     def __load_config(cls, cfg):
@@ -104,6 +105,23 @@ class DeduplicationConfig(AppConfig):
 
         register(DemographicSource())
         register(IdentifierSource())
+
+    @classmethod
+    def __register_review_task_maskers(cls):
+        from individual.task_masking import TaskMask
+        from payroll.models import BenefitConsumption
+        from social_protection.models import Beneficiary
+        from deduplication.masking import mask_review_task, summary_review_task_masker
+        from deduplication.services import (
+            DUPLICATE_CANDIDATE_TASK_SOURCE, CreateDeduplicationPaymentReviewTasksService,
+            CreateDeduplicationReviewTasksService,
+        )
+
+        TaskMask.register_source(DUPLICATE_CANDIDATE_TASK_SOURCE, mask_review_task)
+        TaskMask.register_source(CreateDeduplicationReviewTasksService.get_class_name(),
+                                 summary_review_task_masker(Beneficiary))
+        TaskMask.register_source(CreateDeduplicationPaymentReviewTasksService.get_class_name(),
+                                 summary_review_task_masker(BenefitConsumption))
 
     @classmethod
     def __connect_task_bridge(cls):
