@@ -132,3 +132,13 @@ class MergeDuplicateBeneficiariesEnrolmentTest(TestCase):
         self._refresh()
         self.assertTrue(self.other.is_deleted)
         self.assertEqual(self.oldest.status, BeneficiaryStatus.ACTIVE)
+
+    def test_empty_values_merged_over_the_same_empty_values_change_nothing(self):
+        self.oldest.json_ext = {"k1": "v1", "flag": False, "n": 0}
+        self.oldest.save(username=self.user.username)
+        hook = self._hook()
+        self._complete_review_task({"flag": False, "n": 0, "absent": ""})
+
+        self.assertEqual([call for call in hook.calls if call[0] == "service"], [])
+        self._refresh()
+        self.assertEqual(self.oldest.json_ext, {"k1": "v1", "flag": False, "n": 0})

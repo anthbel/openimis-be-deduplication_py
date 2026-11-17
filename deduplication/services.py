@@ -388,9 +388,12 @@ def _update_instance_if_different_value(instance, instance_kwargs, user):
 
 
 def _merged_json_ext(json_ext, json_ext_kwargs):
-    """``json_ext`` with each key of ``json_ext_kwargs`` set to its value, or removed when the value is empty."""
+    """``json_ext`` with each key of ``json_ext_kwargs`` set to its value, or removed when the value is empty; a
+    key whose stored value and merge value are both empty is left as it is."""
     merged = dict(json_ext or {})
     for key, value in (json_ext_kwargs or {}).items():
+        if not merged.get(key) and not value:
+            continue
         if value:
             merged[key] = value
         else:
