@@ -39,6 +39,7 @@ Config: `BIOMETRIC["SUBJECT_MODEL"]` and `DEDUPLICATION["SUBJECT_MODEL"]`, both 
 class Watermark:
     updated_at: datetime | None = None
     last_id: str | None = None
+    snapshot: ReadSnapshot | None = None   # row versions the scan read (deduplication/sources/snapshot.py)
 
 @dataclass(frozen=True)
 class Candidate:
@@ -55,6 +56,9 @@ class CandidateSource(abc.ABC):
     def scan(self, since: Watermark | None) -> Iterable[Candidate]: ...
     @abc.abstractmethod
     def watermark(self) -> Watermark: ...      # where the next scan starts
+    def covered(self, subject_model: str, subject_ids, state) -> set: ...
+        # the ids, as passed, its last scan covered; default: (date_updated, id) at or before the cursor
+        # and the current version read by the scan's snapshot
 
 def register(source: CandidateSource) -> None
 def sources() -> list[CandidateSource]        # registration order
@@ -318,9 +322,11 @@ run_scan(*, kinds: list[str] | None = None, actor: str) -> dict   # counts per k
 scan_subject(subject_model, subject_id) -> list[DuplicateCandidate]   # on-demand, all sources
 ```
 Management command `scan_duplicates [--kind KIND]`. `run_scan` reads `ScanState`, captures
-`source.watermark()`, calls `source.scan(since)`, records, then stores the captured watermark.
-A subject written while the scan iterates is newer than the captured cursor and is revisited by
-the next scan; `record_candidate` is idempotent, so the revisit is harmless.
+`source.watermark()`, calls `source.scan(since)`, records, then stores the captured watermark,
+its snapshot under `ScanState.summary["snapshot"]`. A row committed after the snapshot was taken,
+whatever its `date_updated`, is not read by it and is revisited by the next scan;
+`record_candidate` is idempotent, so the revisit is harmless. The snapshot's rules are in the
+module README ("Scan cursor").
 
 Each source runs in its own transaction. A source that raises is logged, its candidates and its
 `ScanState` watermark are rolled back, and the other sources still run. The returned dict holds
@@ -406,7 +412,7 @@ the sibling-confirmed pass-through, which plans no merge), and the enrolment gua
 longer `OPEN` needs no decision and is never refused. An unknown `decision` raises `ValueError`.
 
 Review through Tasks Management stays available: `create_review_tasks(candidate_ids, actor)`
-creates one `tasks_management.Task` per candidate (`source="deduplication_candidate"`, `data` =
+creates one `tasks_management.Task` per candidate `actor` may see (`source="deduplication_candidate"`, `data` =
 candidate summary, `task` FK set). A `pre_save` receiver on `tasks_management.Task` bridges the
 completion: when a `deduplication_candidate` task moves to `COMPLETED` and its candidate is
 `OPEN`, it calls `resolve()` with the decision of the approver whose action completes the task,
@@ -441,7 +447,10 @@ refusal's `deduplication.resolve.<reason>` code and English message when `resolv
 would refuse the decision, and true (`code` and `message` null) otherwise, including for a candidate
 that is no longer `OPEN`. It needs `gql_query_duplicates_perms`, like the candidate queries; a
 caller without it gets the `Unauthorized` GraphQL error and no result. An unknown `decision` or a
-missing candidate is a GraphQL error. Mutations `runDuplicateScan(kinds)`,
+missing candidate is a GraphQL error. The candidate queries, the `node` lookup and a task's
+`duplicateCandidates` give a pair only when both subjects are within the user's locations
+(`DuplicateCandidate.get_queryset`, which applies the subject model's own `get_queryset`); for
+`duplicateCandidateResolveCheck` a pair out of scope is a missing candidate. Mutations `runDuplicateScan(kinds)`,
 `resolveDuplicateCandidate(id, decision, keep, note)`, `createDuplicateReviewTasks(ids)`.
 Rights: `gql_resolve_duplicate_perms=["172003"]`, `gql_run_scan_perms=["172004"]`,
 `gql_query_duplicates_perms=["172005"]` via module configuration; review-task creation keeps
@@ -449,7 +458,8 @@ Rights: `gql_resolve_duplicate_perms=["172003"]`, `gql_run_scan_perms=["172004"]
 
 Every refusal of `resolve` is a `ResolveRefusal` (a `ValueError`) carrying its code:
 `deduplication.resolve.keep_not_in_pair`, `subject_deleted`, `keep_contradicts_merge`,
-`retired_subject_enrolled`, `pair_already_merged` and `decision_missing` (task bridge only);
+`retired_subject_enrolled`, `pair_already_merged`, and `decision_missing` and `candidate_out_of_scope`
+(task bridge only: the completing approver may not see one of the pair's subjects);
 `str()` starts with the code. `resolveDuplicateCandidate` records a refusal in the mutation log
 as `{"message": <readable English text>, "code": <code>, "detail": <code and details>}`. The
 openIMIS journal prints `[code] message` and shows `detail` when expanded; it translates
