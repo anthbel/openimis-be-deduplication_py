@@ -20,6 +20,7 @@ from deduplication.gql_queries import (
 )
 from deduplication.masking import mask_summary_values, unmasked_candidate_order_by
 from deduplication.models import DuplicateCandidate
+from deduplication.optional_apps import require_beneficiary_deduplication, require_payment_deduplication
 from deduplication.services import ResolveRefusal, check_resolve
 from individual.data_masking import may_see_masked
 
@@ -86,6 +87,7 @@ class Query(graphene.ObjectType):
     )
 
     def resolve_beneficiary_deduplication_summary(self, info, columns=None, benefit_plan_id=None, **kwargs):
+        require_beneficiary_deduplication()
         from social_protection.apps import SocialProtectionConfig
         from social_protection.models import Beneficiary
         from deduplication.services import get_beneficiary_duplication_aggregation
@@ -121,6 +123,7 @@ class Query(graphene.ObjectType):
         return DeduplicationSummaryGQLType(rows=rows)
 
     def resolve_benefit_deduplication_summary(self, info, columns=None, payment_cycle_id=None, **kwargs):
+        require_payment_deduplication()
         from social_protection.apps import SocialProtectionConfig
         from individual.models import Individual
         from payroll.models import BenefitConsumption

@@ -26,6 +26,7 @@ from deduplication.apps import DeduplicationConfig
 from deduplication.column_resolution import resolve_columns, is_model_column
 from deduplication.masking import mask_review_task_data
 from deduplication.models import DuplicateCandidate, ScanState
+from deduplication.optional_apps import require_beneficiary_deduplication, require_payment_deduplication
 from deduplication.sources import Candidate, MergePlan, MergeRefusal, Watermark, merge_preparers, order_pair, \
     sources as registered_sources, without_left_out
 from deduplication.validations import CreateDeduplicationReviewTasksValidation, \
@@ -33,13 +34,6 @@ from deduplication.validations import CreateDeduplicationReviewTasksValidation, 
 from deduplication.sources.snapshot import ReadSnapshot
 from individual.data_masking import may_see_masked
 from individual.models import Individual
-from invoice.models import Bill, BillItem
-from payroll.models import BenefitConsumption, BenefitConsumptionStatus, \
-    PayrollBenefitConsumption, PayrollStatus, BenefitAttachment
-from payment_cycle.models import PaymentCycle
-from social_protection.enrolment_hooks import enrolment_write
-from social_protection.models import Beneficiary, BenefitPlan
-from social_protection.services import BeneficiaryService
 from tasks_management.apps import TasksManagementConfig
 from tasks_management.models import Task
 from tasks_management.services import TaskService, _fail_completed_task
@@ -53,6 +47,8 @@ MERGE_STATE_KEY = "current_state"
 
 
 def _beneficiaries_state(beneficiary_ids):
+    from social_protection.models import Beneficiary
+
     return {
         str(row_id): {"status": status, "version": version}
         for row_id, status, version in Beneficiary.objects.filter(id__in=beneficiary_ids).values_list(
@@ -72,6 +68,7 @@ class CreateDeduplicationReviewTasksService:
 
     def create_beneficiary_duplication_tasks(self, summary):
         try:
+            require_beneficiary_deduplication()
             task_service = TaskService(self.user)
             tasks = []
 
@@ -100,6 +97,9 @@ class CreateDeduplicationReviewTasksService:
             return output_exception(model_name='', method="create_beneficiary_duplication_tasks", exception=exc)
 
     def create_beneficiary_duplication_task_serializer(self, data):
+        require_beneficiary_deduplication()
+        from social_protection.models import Beneficiary, BenefitPlan
+
         def serialize_individual(value):
             excluded_fields = self._get_excluded_model_fields()
             individual = Individual.objects.filter(id=value).first()
@@ -193,6 +193,9 @@ class CreateDeduplicationPaymentReviewTasksService:
 
     def create_payment_benefit_duplication_tasks(self, summary, payment_cycle_id):
         try:
+            require_payment_deduplication()
+            from payment_cycle.models import PaymentCycle
+
             task_service = TaskService(self.user)
             tasks = []
             payment_cycle = PaymentCycle.objects.get(id=payment_cycle_id)
@@ -222,6 +225,9 @@ class CreateDeduplicationPaymentReviewTasksService:
             return output_exception(model_name='', method="create_payment_benefit_duplication_tasks", exception=exc)
 
     def flag_duplicated_benefit_payments(self, task_data):
+        require_payment_deduplication()
+        from payroll.models import BenefitConsumption
+
         # flag payroll marked as duplicated
         benefits = BenefitConsumption.objects.filter(id__in=task_data['ids'])
         for benefit in benefits:
@@ -232,6 +238,9 @@ class CreateDeduplicationPaymentReviewTasksService:
                 benefit.save(user=self.user)
 
     def create_payment_benefit_duplication_task_serializer(self, data):
+        require_payment_deduplication()
+        from payroll.models import BenefitConsumption, PayrollBenefitConsumption
+
         def serialize_individual(value):
             excluded_fields = self._get_excluded_model_fields()
             individual = Individual.objects.filter(id=value).first()
@@ -317,6 +326,9 @@ class CreateDeduplicationPaymentReviewTasksService:
 
 
 def get_beneficiary_duplication_aggregation(columns: List[str] = None, benefit_plan_id: str = None):
+    require_beneficiary_deduplication()
+    from social_protection.models import Beneficiary
+
     if not columns:
         raise ValueError("At least one column required")
     if not benefit_plan_id:
@@ -329,6 +341,9 @@ def get_beneficiary_duplication_aggregation(columns: List[str] = None, benefit_p
 
 
 def get_benefit_consumption_duplication_aggregation(columns: List[str] = None, payment_cycle_id: str = None):
+    require_payment_deduplication()
+    from payroll.models import BenefitConsumption, BenefitConsumptionStatus, PayrollBenefitConsumption, PayrollStatus
+
     if not columns:
         raise ValueError("At least one column required")
     if not payment_cycle_id:
@@ -430,6 +445,8 @@ def _update_merged_beneficiary(beneficiary, beneficiary_kwargs, json_ext_kwargs,
     """Writes the merged status and json_ext of ``beneficiary`` through ``BeneficiaryService.update``, whose
     enrolment hooks lock the plan, refuse a status the enrolment rules forbid and adjust the json_ext. Only the
     fields the merge changes are sent; a refusal raises ValidationError."""
+    from social_protection.services import BeneficiaryService
+
     beneficiary.refresh_from_db()
     obj_data = {}
     if 'status' in beneficiary_kwargs and beneficiary_kwargs['status'] != beneficiary.status:
@@ -473,6 +490,8 @@ def _require_json_ext_in_plan_schema(beneficiary, json_ext):
 def _beneficiaries_out_of_scope(beneficiary_ids, user):
     """The ids, sorted, of the existing beneficiaries among ``beneficiary_ids`` that ``user`` may not see
     (``Beneficiary.get_queryset``)."""
+    from social_protection.models import Beneficiary
+
     rows = Beneficiary.objects.filter(id__in=beneficiary_ids)
     visible = set(Beneficiary.get_queryset(rows, user).values_list('id', flat=True))
     return sorted(str(row_id) for row_id in rows.values_list('id', flat=True) if row_id not in visible)
@@ -488,6 +507,8 @@ def _require_beneficiaries_in_scope(beneficiary_ids, user):
 def _benefits_out_of_scope(benefit_ids, user):
     """The ids, sorted, of the existing benefits among ``benefit_ids`` whose person ``user`` may not see
     (``Individual.get_queryset``), the rule of the benefit duplicate summary."""
+    from payroll.models import BenefitConsumption
+
     rows = BenefitConsumption.objects.filter(id__in=benefit_ids)
     visible = set(rows.filter(individual__in=Individual.get_queryset(None, user)).values_list('id', flat=True))
     return sorted(str(row_id) for row_id in rows.values_list('id', flat=True) if row_id not in visible)
@@ -521,6 +542,8 @@ def _require_unchanged_since_task(beneficiary, task_state):
     """Raises ValidationError when the kept ``beneficiary``, read now, no longer has the status and version the
     task recorded for it (``MERGE_STATE_KEY``): a write since then, a suspension among others, needs a new
     review. A task without a recorded state is not checked."""
+    from social_protection.models import Beneficiary
+
     recorded = (task_state or {}).get(str(beneficiary.id))
     if not recorded:
         return
@@ -541,6 +564,10 @@ def merge_duplicate_beneficiaries(task_data, user_id):
     beneficiary the task does not or fewer than two undeleted ones; when the user may not see one of the
     beneficiaries; when the kept one changed since the task was created; when the merged json_ext breaks the
     plan's ``beneficiary_data_schema``; or when a hook refuses it."""
+    require_beneficiary_deduplication()
+    from social_protection.enrolment_hooks import enrolment_write
+    from social_protection.models import Beneficiary
+
     individual_fields = {"first_name", "last_name", "dob"}
     beneficiary_fields = {"status"}
 
@@ -624,6 +651,10 @@ def remove_duplicate_benefit_payments(task_data, user):
     It is refused (ValidationError, nothing removed) when no approver recorded a removal or several recorded
     different ones, when it names a benefit the task does not, or when ``user``, who completes the task, may not
     see the person of one of the benefits."""
+    require_payment_deduplication()
+    from invoice.models import Bill, BillItem
+    from payroll.models import BenefitAttachment, BenefitConsumption, PayrollBenefitConsumption
+
     selection = _recorded_selection(task_data, "benefitIds", "removal")
     benefit_ids = [str(benefit_id) for benefit_id in selection["benefitIds"]]
     _require_in_task(benefit_ids, task_data, "Benefits")

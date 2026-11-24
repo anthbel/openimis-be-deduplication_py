@@ -392,7 +392,7 @@ class DuplicateCandidateScopeTest(openIMISGraphQLTestCase):
 
     def test_a_failed_payment_removal_fails_its_task_and_removes_nothing(self):
         benefits = self._benefits([("Twin", self.village), ("Twin", self.village)])
-        with mock.patch("deduplication.services.PayrollBenefitConsumption.objects.filter",
+        with mock.patch("payroll.models.PayrollBenefitConsumption.objects.filter",
                         side_effect=RuntimeError("payroll locked")):
             task = self._completed_payment_task(benefits)
 

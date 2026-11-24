@@ -4,8 +4,6 @@ from django.db.models import Q
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext as _
 
-from social_protection.models import Beneficiary
-from payroll.models import BenefitConsumption
 from tasks_management.models import Task
 
 
@@ -68,6 +66,8 @@ class CreateDeduplicationReviewTasksValidation:
 
     @classmethod
     def _validate_existence_of_beneficiary(cls, ids):
+        from social_protection.models import Beneficiary
+
         not_existing_ids = []
         for beneficiary_id in ids:
             if not Beneficiary.objects.filter(id=beneficiary_id).exists():
@@ -76,6 +76,8 @@ class CreateDeduplicationReviewTasksValidation:
 
     @classmethod
     def _validate_beneficiary_already_in_task(cls, ids, service_name):
+        from social_protection.models import Beneficiary
+
         beneficiary_in_task = {}
         status_accepted = Task.Status.ACCEPTED
         status_received = Task.Status.RECEIVED
@@ -155,6 +157,8 @@ class CreateDeduplicationPaymentReviewTasksValidation:
 
     @classmethod
     def _validate_existence_of_benefits(cls, ids):
+        from payroll.models import BenefitConsumption
+
         not_existing_ids = []
         for benefits_id in ids:
             if not BenefitConsumption.objects.filter(id=benefits_id).exists():
@@ -163,6 +167,8 @@ class CreateDeduplicationPaymentReviewTasksValidation:
 
     @classmethod
     def _validate_benefits_already_in_task(cls, ids, service_name):
+        from payroll.models import BenefitConsumption
+
         benefit_in_task = {}
         status_accepted = Task.Status.ACCEPTED
         status_received = Task.Status.RECEIVED

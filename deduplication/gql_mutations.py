@@ -5,6 +5,7 @@ from django.core.exceptions import ValidationError, PermissionDenied
 from core.schema import OpenIMISMutation
 from deduplication.apps import DeduplicationConfig
 from deduplication.models import DuplicateCandidate
+from deduplication.optional_apps import require_beneficiary_deduplication, require_payment_deduplication
 from deduplication.services import (
     CreateDeduplicationReviewTasksService,
     CreateDeduplicationPaymentReviewTasksService,
@@ -36,6 +37,7 @@ class CreateDeduplicationReviewMutation(OpenIMISMutation):
             raise ValidationError("mutation.authentication_required")
         if not user.has_perms(DeduplicationConfig.gql_create_deduplication_review_perms):
             raise PermissionDenied("unauthorized")
+        require_beneficiary_deduplication()
         if not summary or len(summary) == 0:
             raise ValidationError("mutation.columns_empty_list")
 
@@ -82,6 +84,7 @@ class CreateDeduplicationPaymentReviewMutation(OpenIMISMutation):
         # rights.
         if not user.has_perms(DeduplicationConfig.gql_create_deduplication_review_perms):
             raise PermissionDenied("unauthorized")
+        require_payment_deduplication()
         if not summary or len(summary) == 0:
             raise ValidationError("mutation.columns_empty_list")
 
