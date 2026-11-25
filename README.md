@@ -137,6 +137,9 @@ through `duplicateCandidates { task }`. The beneficiary and payment review tasks
 summary row they were made from in `data.column_values`; maskers registered for those sources mask
 each value whose column reads a masked field, by the rule of the summaries, on the task, its node
 and its history.
+Both sources keep a masker when their apps are not installed (`social_protection` for the beneficiary
+tasks; `social_protection`, `payroll`, `payment_cycle` and `invoice` for the payment tasks): it then masks
+every value of `data.column_values`, whatever the column.
 
 For a user without the masked-data right, an `orderBy` term of `duplicateCandidates` whose path
 traverses a JSON field (the evidence, or one reached through a relation such as the review task's

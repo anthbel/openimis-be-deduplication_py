@@ -20,7 +20,9 @@ from deduplication.gql_queries import (
 )
 from deduplication.masking import mask_summary_values, unmasked_candidate_order_by
 from deduplication.models import DuplicateCandidate
-from deduplication.optional_apps import require_beneficiary_deduplication, require_payment_deduplication
+from deduplication.optional_apps import (
+    beneficiary_search_perms, require_beneficiary_deduplication, require_payment_deduplication,
+)
 from deduplication.services import ResolveRefusal, check_resolve
 from individual.data_masking import may_see_masked
 
@@ -87,16 +89,14 @@ class Query(graphene.ObjectType):
     )
 
     def resolve_beneficiary_deduplication_summary(self, info, columns=None, benefit_plan_id=None, **kwargs):
-        require_beneficiary_deduplication()
-        from social_protection.apps import SocialProtectionConfig
-        from social_protection.models import Beneficiary
-        from deduplication.services import get_beneficiary_duplication_aggregation
-
         # A borrowing of another module's right, unjustified from the start and left
         # as it stands: reading the duplicates summary is guarded by
         # social_protection's beneficiary search right (170001), not by a deduplication
         # right. Reported by the audit, to be dealt with in the authorisation batch.
-        Query._check_permissions(info.context.user, SocialProtectionConfig.gql_beneficiary_search_perms)
+        Query._check_permissions(info.context.user, beneficiary_search_perms())
+        require_beneficiary_deduplication()
+        from social_protection.models import Beneficiary
+        from deduplication.services import get_beneficiary_duplication_aggregation
 
         if not columns:
             return ["deduplication.validation.no_columns_provided"]
@@ -123,17 +123,15 @@ class Query(graphene.ObjectType):
         return DeduplicationSummaryGQLType(rows=rows)
 
     def resolve_benefit_deduplication_summary(self, info, columns=None, payment_cycle_id=None, **kwargs):
-        require_payment_deduplication()
-        from social_protection.apps import SocialProtectionConfig
-        from individual.models import Individual
-        from payroll.models import BenefitConsumption
-        from deduplication.services import get_benefit_consumption_duplication_aggregation
-
         # Check permissions
         # The same borrowing as above, and further removed still: this summary bears
         # on BenefitConsumption rows (payroll) but is guarded by social_protection's
         # beneficiary search right (170001). Not fixed here.
-        Query._check_permissions(info.context.user, SocialProtectionConfig.gql_beneficiary_search_perms)
+        Query._check_permissions(info.context.user, beneficiary_search_perms())
+        require_payment_deduplication()
+        from individual.models import Individual
+        from payroll.models import BenefitConsumption
+        from deduplication.services import get_benefit_consumption_duplication_aggregation
 
         if not columns:
             return ["deduplication.validation.no_columns_provided"]

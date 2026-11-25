@@ -109,7 +109,7 @@ class DeduplicationConfig(AppConfig):
     @classmethod
     def __register_review_task_maskers(cls):
         from individual.task_masking import TaskMask
-        from deduplication.masking import mask_review_task, summary_review_task_masker
+        from deduplication.masking import mask_review_task, summary_review_task_masker, wholly_masked_review_task
         from deduplication.optional_apps import (
             beneficiary_deduplication_available, payment_deduplication_available,
         )
@@ -119,16 +119,19 @@ class DeduplicationConfig(AppConfig):
         )
 
         TaskMask.register_source(DUPLICATE_CANDIDATE_TASK_SOURCE, mask_review_task)
+        # Each summary source has a masker; one whose app is absent masks its stored tasks whole.
+        beneficiary_masker = wholly_masked_review_task
         if beneficiary_deduplication_available():
             from social_protection.models import Beneficiary
 
-            TaskMask.register_source(CreateDeduplicationReviewTasksService.get_class_name(),
-                                     summary_review_task_masker(Beneficiary))
+            beneficiary_masker = summary_review_task_masker(Beneficiary)
+        TaskMask.register_source(CreateDeduplicationReviewTasksService.get_class_name(), beneficiary_masker)
+        payment_masker = wholly_masked_review_task
         if payment_deduplication_available():
             from payroll.models import BenefitConsumption
 
-            TaskMask.register_source(CreateDeduplicationPaymentReviewTasksService.get_class_name(),
-                                     summary_review_task_masker(BenefitConsumption))
+            payment_masker = summary_review_task_masker(BenefitConsumption)
+        TaskMask.register_source(CreateDeduplicationPaymentReviewTasksService.get_class_name(), payment_masker)
 
     @classmethod
     def __connect_task_bridge(cls):

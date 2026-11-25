@@ -7,6 +7,9 @@ PAYMENT_APPS = ("social_protection", "payroll", "payment_cycle", "invoice")
 
 OPTIONAL_APPS_MISSING = "deduplication.optional_apps_missing"
 
+# social_protection's beneficiary search right, readable while social_protection is not installed.
+BENEFICIARY_SEARCH_PERMS = ["170001"]
+
 
 class OptionalAppsMissing(ValueError):
     """A feature was used while an app it needs is not installed; str() starts with the code, then the details."""
@@ -40,3 +43,13 @@ def require_payment_deduplication():
     missing = missing_apps(PAYMENT_APPS)
     if missing:
         raise OptionalAppsMissing("payment deduplication", missing)
+
+
+def beneficiary_search_perms():
+    """The beneficiary search right the duplication summaries are read with: social_protection's declared value
+    while it is installed, else ``BENEFICIARY_SEARCH_PERMS``."""
+    if not apps.is_installed("social_protection"):
+        return BENEFICIARY_SEARCH_PERMS
+    from social_protection.apps import SocialProtectionConfig
+
+    return SocialProtectionConfig.gql_beneficiary_search_perms

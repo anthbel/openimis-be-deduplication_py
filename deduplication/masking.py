@@ -107,6 +107,20 @@ def summary_review_task_masker(model):
     return mask
 
 
+def wholly_masked_review_task(task):
+    """A task masker for the review tasks made from a duplication summary row of a model whose app is not
+    installed: every value of the stored row's ``column_values`` is replaced by the string mask, whatever its
+    column; a ``column_values`` that is not a dict is replaced whole."""
+    data = getattr(task, "data", None)
+    column_values = data.get("column_values") if isinstance(data, dict) else None
+    if isinstance(column_values, dict):
+        for column in column_values:
+            column_values[column] = MASK_PLACEHOLDER
+    elif column_values is not None:
+        data["column_values"] = MASK_PLACEHOLDER
+    return task
+
+
 def unmasked_candidate_order_by(user, model, order_by):
     """``order_by`` as tasks_management's ``unmasked_json_order_by`` leaves it for every user without the
     masked-data right: a candidate's evidence, and the data of its review task, hold person values."""
